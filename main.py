@@ -301,8 +301,8 @@ async def main():
                 time_string = datetime.fromtimestamp(
                     submission['timestamp']).strftime(DATETIME_FORMAT)
                 extension = filename_extension_table[submission['lang']]
-                filename = './submissions/{}_{}.{}'.format(
-                    id, time_string, extension)
+                filename = './submissions/{:04d}_{}.{}'.format(
+                    int(id), time_string, extension) # type(id) == str
                 with open(filename, 'wb') as fp:
                     try:
                         fp.write(code.encode('utf8'))
