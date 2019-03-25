@@ -90,8 +90,9 @@ def get_last_update():
         SECTION_RECORD,
         RECORD_LAST_UPDATE,
         fallback=the_zeroth_datetime)
-    return datetime.strptime(last_update_str,DATETIME_FORMAT).timestamp()
-
+    last_update = datetime.strptime(last_update_str, DATETIME_FORMAT)
+    return time.mktime(last_update.timetuple())
+    
 
 def set_last_update():
     last_update = time.time()
@@ -323,4 +324,3 @@ async def main():
 
 
 asyncio.get_event_loop().run_until_complete(main())
-
