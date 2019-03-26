@@ -8,12 +8,14 @@ import math
 from datetime import datetime
 import configparser
 from pathlib import Path
+from git import Repo
 
 '''
 global path setting
 '''
 BASE_DIR = Path(__file__).parent
 CONFIG_PATH = Path(BASE_DIR, 'config.ini')
+SUBMISSIONS_PATH = Path(BASE_DIR, 'submissions')
 
 '''
 global datetime setting
@@ -99,6 +101,18 @@ def set_last_update():
     config.set(SECTION_RECORD, RECORD_LAST_UPDATE,
                datetime.fromtimestamp(last_update).strftime(DATETIME_FORMAT))
     write_config()
+
+
+def git_push(updated_files):
+    repo = Repo('submissions')
+    repo.index.add(updated_files)
+    if len(updated_files) == 1:
+        title = 'Update 1 answer'
+    else:
+        title = 'Update {} answers'.format(len(updated_files))
+    content = 'Updated files:\n{}'.format('\n'.join(updated_files))
+    repo.index.commit('{}\n\n{}'.format(title, content))
+    repo.remotes['origin'].push()
 
 
 '''
@@ -275,6 +289,7 @@ async def main():
 
     submissions = [s for s in filtered if s is not None]
     updated_cnt = len(submissions)
+    updated_files = []
 
     async def get_code():
         page = await browser.newPage()
@@ -301,9 +316,11 @@ async def main():
                 time_string = datetime.fromtimestamp(
                     submission['timestamp']).strftime(DATETIME_FORMAT)
                 extension = filename_extension_table[submission['lang']]
-                filename = './submissions/{:04d}_{}.{}'.format(
+                filename = '{:04d}_{}.{}'.format(
                     int(id), time_string, extension) # type(id) == str
-                with open(filename, 'wb') as fp:
+                updated_files.append(filename)
+                file_path = SUBMISSIONS_PATH / filename
+                with open(file_path, 'wb') as fp:
                     try:
                         fp.write(code.encode('utf8'))
                     except Exception as e:
@@ -319,6 +336,9 @@ async def main():
         print('{} submission is updated.'.format(updated_cnt))
     else:
         print('{} submissions are updated.'.format(updated_cnt))
+
+    if updated_cnt > 0:
+        git_push(updated_files)
 
     await close()
 
