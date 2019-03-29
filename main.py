@@ -338,6 +338,7 @@ async def main():
         print('{} submissions are updated.'.format(updated_cnt))
 
     if updated_cnt > 0:
+        updated_files.sort()
         git_push(updated_files)
 
     await close()
