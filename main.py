@@ -39,7 +39,8 @@ MAX_PAGE = 10
 
 filename_extension_table = {
     'javascript': 'js',
-    'bash': 'sh'
+    'bash': 'sh',
+    'python3': 'py'
 }
 
 
