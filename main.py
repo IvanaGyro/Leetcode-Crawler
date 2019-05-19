@@ -42,6 +42,7 @@ filename_extension_table = {
     'bash': 'sh',
     'python': 'py',
     'python3': 'py',
+    'cpp': 'cpp',
 }
 
 
