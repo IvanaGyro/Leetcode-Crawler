@@ -35,7 +35,7 @@ USER_PASSWORD = 'Password'
 browser setting
 '''
 MAX_PAGE = 10
-
+RETRY = 5
 
 filename_extension_table = {
     'javascript': 'js',
@@ -230,29 +230,33 @@ async def main():
     submissions = [None]*total_submissions
 
     async def get_submissions(offset):
-        try:
-            page = await browser.newPage()
-            # server do not permit sending requests with short interval
-            time.sleep(1)
-            rspns = await page.goto(
-                # The maximum limit is 20
-                'https://leetcode.com/api/submissions/?offset={}&limit=20'.format(
-                    offset),
-                waitUnti='networkidle0')
-            body = await rspns.text()
-            if rspns.status == 200:
-                tmp = json.loads(body)
-                submission_profiles = tmp['submissions_dump']
-                idx = offset
-                for submission in submission_profiles:
-                    submissions[idx] = submission
-                    idx += 1
-            else:
-                print('response status:{}. body:{}. offset:{}'.format(
-                    rspns.status, body, offset))
-            await page.close()
-        except Exception as e:
-            print('Exception:{}. offset: {}\n'.format(e, offset))
+        for retry in range(RETRY):
+            try:
+                page = await browser.newPage()
+                # server do not permit sending requests with short interval
+                time.sleep(2)
+                rspns = await page.goto(
+                    # The maximum limit is 20
+                    'https://leetcode.com/api/submissions/?offset={}&limit=20'.format(
+                        offset),
+                    waitUnti='networkidle0')
+                body = await rspns.text()
+                if rspns.status == 200:
+                    tmp = json.loads(body)
+                    submission_profiles = tmp['submissions_dump']
+                    idx = offset
+                    for submission in submission_profiles:
+                        submissions[idx] = submission
+                        idx += 1
+                    await page.close()
+                    return
+                else:
+                    print('response status:{}. body:{}. offset:{}'.format(
+                        rspns.status, body, offset))
+                    await page.close()
+            except Exception as e:
+                if retry == RETRY - 1:
+                    print('Exception:{}. offset: {}\n'.format(e, offset))
 
     tasks = [get_submissions(idx*20)
              for idx in range(0, math.ceil(total_submissions/20))]
