@@ -43,6 +43,7 @@ filename_extension_table = {
     'python': 'py',
     'python3': 'py',
     'cpp': 'cpp',
+    'mysql': 'sql',
 }
 
 
