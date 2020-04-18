@@ -185,18 +185,18 @@ async def main():
     try:
         await page.waitForSelector('#initial-loading[data-is-hide="true"]', timeout=15000)
     except pyppeteer.errors.TimeoutError as e:
-        await page.waitForSelector('#username-input', timeout=3000)
-        await page.waitForSelector('#password-input', timeout=3000)
+        await page.waitForSelector('#id_login', timeout=3000)
+        await page.waitForSelector('#id_password', timeout=3000)
 
     '''
     Login
     '''
     username, password = get_user()
-    await page.focus('#username-input')
+    await page.focus('#id_login')
     await page.keyboard.type(username)
-    await page.focus('#password-input')
+    await page.focus('#id_password')
     await page.keyboard.type(password)
-    await page.click('#sign-in-button')
+    await page.click('#signin_btn')
 
     rspns = await page.waitForResponse(
         lambda rspns: rspns.url == 'https://leetcode.com/accounts/login/' and
