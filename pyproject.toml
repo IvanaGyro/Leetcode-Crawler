@@ -6,6 +6,8 @@ readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
     "patchright==1.61.2",
+    "pytest>=8,<9",
+    "pytest-mock>=3.14,<4",
 ]
 
 [tool.pixi.workspace]
@@ -22,4 +24,7 @@ platforms = [
 [tool.pixi.tasks]
 crawler = { cmd = "python main.py", depends-on = ["install-browser"] }
 install-browser = "patchright install chromium"
-test = "python -m unittest discover -s tests -v"
+test = "python -m pytest"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
