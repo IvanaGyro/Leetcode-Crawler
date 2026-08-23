@@ -1,11 +1,11 @@
 import asyncio
 import configparser
-import subprocess
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 
 import main
+import pygit2
 
 
 def test_parse_timestamp_accepts_epoch_and_iso():
@@ -39,6 +39,7 @@ def test_only_new_questions_are_selected_and_watermark_is_stable():
     changed, watermark = main.questions_since(questions, checkpoint=100)
     assert [question.title_slug for question in changed] == ["new", "newer"]
     assert watermark == 300
+
 
 def test_missing_timestamp_is_retried_instead_of_skipped():
     question = main.SolvedQuestion("1", "Unknown", "unknown", None)
@@ -405,31 +406,122 @@ def test_checkpoint_preserves_configured_password(tmp_path):
     ) == "1700000000"
 
 
+def _create_repository(path: Path) -> pygit2.Repository:
+    repository = pygit2.init_repository(str(path))
+    repository.config["user.name"] = "Crawler Test"
+    repository.config["user.email"] = "crawler-test@example.invalid"
+    return repository
+
+
+def _commit_file(
+    repository: pygit2.Repository, path: Path, message: str
+) -> pygit2.Oid:
+    repository.index.add(path.name)
+    repository.index.write()
+    signature = repository.default_signature
+    parents = [] if repository.head_is_unborn else [repository.head.target]
+    return repository.create_commit(
+        "HEAD", signature, signature, message, repository.index.write_tree(), parents
+    )
+
+
 def test_commit_contains_only_updated_submission_files(tmp_path):
-    repo = tmp_path
+    repository = _create_repository(tmp_path)
+    baseline = tmp_path / "baseline.txt"
+    baseline.write_text("baseline", encoding="utf-8")
+    _commit_file(repository, baseline, "baseline")
 
-    def git(*arguments):
-        return subprocess.run(
-            ["git", "-C", str(repo), *arguments],
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-
-    git("init", "--quiet")
-    git("config", "user.name", "Crawler Test")
-    git("config", "user.email", "crawler-test@example.invalid")
-    (repo / "baseline.txt").write_text("baseline", encoding="utf-8")
-    git("add", "baseline.txt")
-    git("commit", "--quiet", "-m", "baseline")
-
-    (repo / "unrelated.txt").write_text("unrelated", encoding="utf-8")
-    git("add", "unrelated.txt")
-    answer = repo / "0001_20240101_000000.py"
+    unrelated = tmp_path / "unrelated.txt"
+    unrelated.write_text("unrelated", encoding="utf-8")
+    repository.index.add(unrelated.name)
+    repository.index.write()
+    answer = tmp_path / "0001_20240101_000000.py"
     answer.write_text("answer", encoding="utf-8")
 
-    assert main.git_commit(repo, [answer])
-    committed = git("show", "--pretty=", "--name-only", "HEAD").stdout.splitlines()
-    staged = git("diff", "--cached", "--name-only").stdout.splitlines()
-    assert committed == [answer.name]
-    assert staged == ["unrelated.txt"]
+    assert main.git_commit(repository, [answer])
+    committed = repository[repository.head.target]
+    changed = repository.diff(committed.parents[0].tree, committed.tree)
+    staged = repository.index.diff_to_tree(committed.tree)
+    assert [patch.delta.new_file.path for patch in changed] == [answer.name]
+    assert [patch.delta.new_file.path for patch in staged] == [unrelated.name]
+
+
+def test_non_git_submission_folder_warns(tmp_path, capsys):
+    _create_repository(tmp_path)
+    submissions_path = tmp_path / "submissions"
+    submissions_path.mkdir()
+
+    repository = main.open_submission_repository(
+        submissions_path, push_requested=True
+    )
+
+    assert repository is None
+    stderr = capsys.readouterr().err
+    assert "Warning: submission folder" in stderr
+    assert "is not a Git repository" in stderr
+    assert "requested push is unavailable" in stderr
+
+
+def test_push_without_remote_warns_and_is_skipped(tmp_path, capsys):
+    repository = _create_repository(tmp_path)
+    baseline = tmp_path / "baseline.txt"
+    baseline.write_text("baseline", encoding="utf-8")
+    _commit_file(repository, baseline, "baseline")
+
+    assert not main.git_push(repository, tmp_path)
+
+    stderr = capsys.readouterr().err
+    assert "Warning: Git push was requested" in stderr
+    assert "no configured remote" in stderr
+
+
+def test_scp_style_remote_uses_anonymous_ssh_transport(tmp_path):
+    repository = _create_repository(tmp_path)
+    remote = repository.remotes.create(
+        "origin", "git@example.com:owner/submissions.git"
+    )
+
+    transport = main._push_transport(repository, remote)
+
+    assert remote.url == "git@example.com:owner/submissions.git"
+    assert transport.url == "ssh://git@example.com/owner/submissions.git"
+
+
+def test_push_warns_when_pygit2_lacks_remote_protocol_support(
+    tmp_path, capsys, mocker
+):
+    repository = _create_repository(tmp_path)
+    answer = tmp_path / "0001_20240101_000000.py"
+    answer.write_text("answer", encoding="utf-8")
+    _commit_file(repository, answer, "answer")
+    repository.remotes.create("origin", "https://example.invalid/repo.git")
+    transport = mocker.MagicMock()
+    transport.push.side_effect = pygit2.GitError("unsupported URL protocol")
+    mocker.patch("main._push_transport", return_value=transport)
+
+    assert not main.git_push(repository, tmp_path)
+
+    stderr = capsys.readouterr().err
+    assert "Warning: Git push was requested" in stderr
+    assert "pygit2 does not support" in stderr
+
+
+def test_push_uses_a_configured_remote_and_sets_upstream(tmp_path):
+    repo_path = tmp_path / "submissions"
+    remote_path = tmp_path / "remote.git"
+    repository = _create_repository(repo_path)
+    remote_repository = pygit2.init_repository(str(remote_path), bare=True)
+    answer = repo_path / "0001_20240101_000000.py"
+    answer.write_text("answer", encoding="utf-8")
+    _commit_file(repository, answer, "answer")
+    branch = repository.branches.get(repository.head.shorthand)
+    assert branch is not None
+    remote = repository.remotes.create("origin", str(remote_path))
+
+    assert main.git_push(repository, repo_path)
+
+    pushed = remote_repository.references[
+        f"refs/heads/{branch.branch_name}"
+    ].target
+    assert pushed == repository.head.target
+    assert branch.upstream_name == f"refs/remotes/{remote.name}/{branch.branch_name}"

@@ -6,7 +6,9 @@ it under `submissions/`, and optionally commit and push the changed files.
 ## Requirements
 
 - [Pixi](https://pixi.prefix.dev/)
-- Git (only needed for automatic commits and pushes)
+- Python 3.11 or later (installed by Pixi)
+- A Git repository for `submissions/` (only needed for automatic commits and
+  pushes)
 - Chrome, or Patchright's Chromium browser
 
 ## Configuration
@@ -22,6 +24,9 @@ Create or clone the output repository if you want automatic Git commits:
 git init submissions
 # or: git clone <your-remote-repository> submissions
 ```
+
+The crawler performs its automatic Git operations through `pygit2`; it does
+not invoke the Git command-line executable.
 
 ## Usage
 
@@ -59,6 +64,13 @@ The checkpoint advances only after every requested solution is downloaded and
 the configured Git operation succeeds. A failed run is therefore safe to retry.
 `ConcurrentDownloads` in `[Browser]` accepts values from 1 through 32;
 `RequestDelaySeconds` is applied globally rather than once per worker.
+
+`submissions/` must itself be a Git working tree; being a subdirectory of a
+different repository is not sufficient. If it is not a repository, solutions
+are still written but the crawler warns and skips the commit. When pushing is
+requested but no push target is available (for example, there is no configured
+remote), or its `pygit2` build cannot support the configured remote protocol,
+it warns and skips the push.
 
 ## Testing
 

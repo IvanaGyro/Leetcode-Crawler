@@ -7,7 +7,6 @@ import getpass
 import json
 import os
 import re
-import subprocess
 import sys
 import time
 from dataclasses import dataclass
@@ -16,6 +15,7 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
 from curl_cffi.requests.exceptions import RequestException
+import pygit2
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -55,6 +55,10 @@ LOGIN_ERROR_PHRASES = (
     "too many login",
     "account is locked",
     "account has been locked",
+)
+
+SCP_STYLE_SSH_URL = re.compile(
+    r"^(?P<user_host>(?:[^@/:\\]+@)?[^/:\\]+):(?P<path>.+)$"
 )
 
 
@@ -892,89 +896,229 @@ def login(page: Any, settings: Settings) -> None:
     )
 
 
-def _run_git(
-    repo_path: Path,
-    arguments: Sequence[str],
-    *,
-    check: bool = True,
-) -> subprocess.CompletedProcess[str]:
-    result = subprocess.run(
-        ["git", "-C", str(repo_path), *arguments],
-        check=False,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-    )
-    if check and result.returncode != 0:
-        message = result.stderr.strip() or result.stdout.strip() or "unknown error"
-        raise CrawlerError(f"Git command failed: {message}")
-    return result
+def open_submission_repository(
+    path: Path, *, push_requested: bool
+) -> pygit2.Repository | None:
+    """Open ``path`` only when it is itself a non-bare Git worktree."""
+    repository: pygit2.Repository | None = None
+    if path.is_dir():
+        try:
+            repository_path = pygit2.discover_repository(str(path))
+            if repository_path is not None:
+                candidate = pygit2.Repository(repository_path)
+                if candidate.workdir is not None and (
+                    Path(candidate.workdir).resolve() == path.resolve()
+                ):
+                    repository = candidate
+        except (OSError, pygit2.GitError):
+            pass
+
+    if repository is None:
+        push_detail = " The requested push is unavailable." if push_requested else ""
+        print(
+            f"Warning: submission folder {path} is not a Git repository; "
+            f"Git commit was skipped.{push_detail}",
+            file=sys.stderr,
+        )
+    return repository
 
 
-def is_git_repository(path: Path) -> bool:
-    if not path.is_dir():
+def _relative_submission_files(
+    repository: pygit2.Repository, updated_files: Sequence[Path]
+) -> list[str]:
+    if repository.workdir is None:
+        raise CrawlerError("Git repository has no working directory")
+
+    workdir = Path(repository.workdir).resolve()
+    relative_files: set[str] = set()
+    for path in updated_files:
+        try:
+            relative_files.add(
+                path.resolve().relative_to(workdir).as_posix()
+            )
+        except ValueError as exc:
+            raise CrawlerError(
+                f"Updated submission {path} is outside the Git repository"
+            ) from exc
+    return sorted(relative_files)
+
+
+def git_commit(
+    repository: pygit2.Repository, updated_files: Sequence[Path]
+) -> bool:
+    """Commit only the supplied submission files, preserving other staging."""
+    if not updated_files:
         return False
-    result = _run_git(
-        path, ["rev-parse", "--is-inside-work-tree"], check=False
-    )
-    return result.returncode == 0 and result.stdout.strip() == "true"
 
+    relative_files = _relative_submission_files(repository, updated_files)
+    try:
+        worktree_index = repository.index
+        for path in relative_files:
+            worktree_index.add(path)
+        worktree_index.write()
 
-def git_commit(repo_path: Path, updated_files: Sequence[Path]) -> bool:
-    if not updated_files or not is_git_repository(repo_path):
+        commit_index = pygit2.Index()
+        parents: list[pygit2.Oid] = []
+        head_commit: pygit2.Commit | None = None
+        if not repository.head_is_unborn:
+            head_commit = repository[repository.head.target]
+            commit_index.read_tree(head_commit.tree)
+            parents.append(head_commit.id)
+        for path in relative_files:
+            commit_index.add(worktree_index[path])
+        tree_id = commit_index.write_tree(repository)
+    except (KeyError, pygit2.GitError) as exc:
+        raise CrawlerError(f"Git could not stage the updated submissions: {exc}") from exc
+
+    if head_commit is not None and tree_id == head_commit.tree.id:
         return False
-    relative_files = sorted(
-        path.resolve().relative_to(repo_path.resolve()).as_posix()
-        for path in updated_files
-    )
-    _run_git(repo_path, ["add", "--", *relative_files])
-    diff = _run_git(
-        repo_path,
-        ["diff", "--cached", "--quiet", "--", *relative_files],
-        check=False,
-    )
-    if diff.returncode == 0:
-        return False
-    if diff.returncode != 1:
-        raise CrawlerError("Git could not inspect the staged submissions")
 
     count = len(relative_files)
     title = f"Update {count} answer" if count == 1 else f"Update {count} answers"
     body = "Updated files:\n" + "\n".join(relative_files)
-    _run_git(
-        repo_path,
-        ["commit", "--only", "-m", title, "-m", body, "--", *relative_files],
-    )
+    try:
+        signature = repository.default_signature
+    except (KeyError, pygit2.GitError) as exc:
+        raise CrawlerError(
+            "Git commit failed: configure user.name and user.email in the "
+            "submission repository"
+        ) from exc
+    try:
+        repository.create_commit(
+            "HEAD", signature, signature, f"{title}\n\n{body}", tree_id, parents
+        )
+    except pygit2.GitError as exc:
+        raise CrawlerError(f"Git commit failed: {exc}") from exc
     return True
 
 
-def git_push(repo_path: Path) -> bool:
-    if not is_git_repository(repo_path):
-        print("Submissions were written, but submissions/ is not a Git repository.")
-        return False
-    has_head = _run_git(
-        repo_path, ["rev-parse", "--verify", "HEAD"], check=False
+def _push_remote(
+    repository: pygit2.Repository, branch: pygit2.Branch
+) -> tuple[pygit2.Remote, pygit2.Branch | None] | None:
+    try:
+        upstream = branch.upstream
+    except (KeyError, ValueError, pygit2.GitError):
+        upstream = None
+    if upstream is not None:
+        try:
+            return repository.remotes[upstream.remote_name], upstream
+        except (KeyError, ValueError):
+            pass
+
+    try:
+        remote_name = str(repository.config["remote.pushDefault"])
+        return repository.remotes[remote_name], None
+    except KeyError:
+        pass
+
+    try:
+        return repository.remotes["origin"], None
+    except KeyError:
+        remotes = list(repository.remotes)
+        return (remotes[0], None) if len(remotes) == 1 else None
+
+
+def _push_transport(
+    repository: pygit2.Repository, remote: pygit2.Remote
+) -> pygit2.Remote:
+    """Create an SSH transport for Git's SCP-style remote URLs when needed."""
+    url = remote.push_url or remote.url
+    if "://" in url or re.match(r"^[A-Za-z]:[\\/]", url):
+        return remote
+    match = SCP_STYLE_SSH_URL.fullmatch(url)
+    if match is None:
+        return remote
+    normalized_url = (
+        f"ssh://{match.group('user_host')}/"
+        f"{match.group('path').lstrip('/')}"
     )
-    if has_head.returncode != 0:
-        return False
-    origin = _run_git(
-        repo_path, ["remote", "get-url", "origin"], check=False
-    )
-    if origin.returncode != 0:
+    return repository.remotes.create_anonymous(normalized_url)
+
+
+class _PushCallbacks(pygit2.RemoteCallbacks):
+    def __init__(self) -> None:
+        super().__init__()
+        self.rejection: str | None = None
+
+    def credentials(
+        self, url: str, username_from_url: str | None, allowed_types: int
+    ) -> pygit2.KeypairFromAgent | pygit2.Username | None:
+        username = username_from_url or getpass.getuser()
+        if allowed_types & pygit2.enums.CredentialType.SSH_KEY:
+            return pygit2.KeypairFromAgent(username)
+        if allowed_types & pygit2.enums.CredentialType.USERNAME:
+            return pygit2.Username(username)
+        return None
+
+    def push_update_reference(self, refname: str, message: str | None) -> None:
+        if message:
+            self.rejection = f"{refname}: {message}"
+
+
+def git_push(repository: pygit2.Repository, repo_path: Path) -> bool:
+    """Push the checked-out branch when this repository has a push target."""
+    if repository.head_is_unborn:
         print(
-            "Git commit created, but submissions/ has no origin remote; "
-            "push skipped."
+            f"Warning: Git push was requested, but submission folder {repo_path} "
+            "has no commits; push skipped.",
+            file=sys.stderr,
+        )
+        return False
+    if repository.head_is_detached:
+        print(
+            f"Warning: Git push was requested, but submission folder {repo_path} "
+            "has a detached HEAD; push skipped.",
+            file=sys.stderr,
         )
         return False
 
-    first_push = _run_git(repo_path, ["push"], check=False)
-    if first_push.returncode == 0:
-        return True
-    if "upstream branch" not in first_push.stderr.lower():
-        message = first_push.stderr.strip() or first_push.stdout.strip()
-        raise CrawlerError(f"Git push failed: {message}")
-    _run_git(repo_path, ["push", "--set-upstream", "origin", "HEAD"])
+    branch = repository.branches.get(repository.head.shorthand)
+    if branch is None:
+        print(
+            f"Warning: Git push was requested, but submission folder {repo_path} "
+            "has no checked-out branch; push skipped.",
+            file=sys.stderr,
+        )
+        return False
+
+    push_target = _push_remote(repository, branch)
+    if push_target is None:
+        print(
+            f"Warning: Git push was requested, but submission folder {repo_path} "
+            "has no configured remote; push skipped.",
+            file=sys.stderr,
+        )
+        return False
+    remote, upstream = push_target
+    target_branch = upstream.branch_name if upstream is not None else branch.branch_name
+    callbacks = _PushCallbacks()
+
+    try:
+        transport = _push_transport(repository, remote)
+        transport.push(
+            [f"{branch.name}:refs/heads/{target_branch}"], callbacks=callbacks
+        )
+    except pygit2.GitError as exc:
+        if "unsupported url protocol" in str(exc).lower():
+            print(
+                "Warning: Git push was requested, but pygit2 does not support "
+                f"the configured remote URL for submission folder {repo_path}; "
+                "push skipped.",
+                file=sys.stderr,
+            )
+            return False
+        raise CrawlerError(f"Git push failed: {exc}") from exc
+    if callbacks.rejection is not None:
+        raise CrawlerError(f"Git push failed: {callbacks.rejection}")
+
+    if upstream is None:
+        remote_reference = f"refs/remotes/{remote.name}/{target_branch}"
+        repository.references.create(
+            remote_reference, repository.head.target, force=True
+        )
+        remote_branch = repository.branches.get(f"{remote.name}/{target_branch}")
+        if remote_branch is not None:
+            branch.upstream = remote_branch
     return True
 
 
@@ -1154,12 +1298,26 @@ def execute(args: argparse.Namespace) -> None:
         return
 
     submission_files, updated_count, watermark = result
-    committed = git_commit(settings.submissions_path, submission_files)
-    if settings.push:
-        git_push(settings.submissions_path)
+    repository = open_submission_repository(
+        settings.submissions_path, push_requested=settings.push
+    )
+    if repository is None:
+        committed = False
+        push_succeeded = not settings.push
+    else:
+        committed = git_commit(repository, submission_files)
+        push_succeeded = not settings.push or git_push(
+            repository, settings.submissions_path
+        )
 
     if watermark > checkpoint:
-        save_checkpoint(config, settings.config_path, watermark)
+        if push_succeeded:
+            save_checkpoint(config, settings.config_path, watermark)
+        else:
+            print(
+                "Git push was skipped, so the checkpoint was not advanced.",
+                file=sys.stderr,
+            )
 
     noun = "submission" if updated_count == 1 else "submissions"
     print(f"{updated_count} {noun} updated.")
