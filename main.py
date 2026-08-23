@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import configparser
 import getpass
 import json
@@ -13,6 +14,8 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
+
+from curl_cffi.requests.exceptions import RequestException
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -39,6 +42,9 @@ USER_PASSWORD = "Password"
 ACCEPTED_STATUS = 10
 GRAPHQL_PAGE_SIZE = 100
 GRAPHQL_RETRIES = 5
+LEETCODE_SESSION_COOKIE = "LEETCODE_SESSION"
+DEFAULT_CONCURRENT_DOWNLOADS = 8
+MAX_CONCURRENT_DOWNLOADS = 32
 
 LOGIN_ERROR_PHRASES = (
     "incorrect username",
@@ -176,6 +182,7 @@ class Settings:
     login_timeout_seconds: int
     request_delay_seconds: float
     manual_login: bool
+    concurrent_downloads: int = DEFAULT_CONCURRENT_DOWNLOADS
 
 
 def load_config(path: Path) -> configparser.ConfigParser:
@@ -329,14 +336,29 @@ def resolve_settings(
         request_delay = config.getfloat(
             SECTION_BROWSER, "RequestDelaySeconds", fallback=0.25
         )
+        configured_concurrency = config.getint(
+            SECTION_BROWSER,
+            "ConcurrentDownloads",
+            fallback=DEFAULT_CONCURRENT_DOWNLOADS,
+        )
     except ValueError as exc:
         raise CrawlerError(
-            "Browser timeout and request delay settings must be numeric"
+            "Browser timeout, request delay, and concurrency settings must be numeric"
         ) from exc
+    concurrency_argument = getattr(args, "concurrency", None)
+    concurrency = (
+        configured_concurrency
+        if concurrency_argument is None
+        else concurrency_argument
+    )
     if login_timeout < 10:
         raise CrawlerError("LoginTimeoutSeconds must be at least 10")
     if request_delay < 0:
         raise CrawlerError("RequestDelaySeconds cannot be negative")
+    if not 1 <= concurrency <= MAX_CONCURRENT_DOWNLOADS:
+        raise CrawlerError(
+            f"ConcurrentDownloads must be between 1 and {MAX_CONCURRENT_DOWNLOADS}"
+        )
 
     return Settings(
         config_path=args.config.resolve(),
@@ -349,6 +371,7 @@ def resolve_settings(
         browser_channel=channel,
         login_timeout_seconds=login_timeout,
         request_delay_seconds=request_delay,
+        concurrent_downloads=concurrency,
         manual_login=args.manual_login,
     )
 
@@ -443,85 +466,118 @@ def _graphql_error_message(payload: Mapping[str, Any]) -> str:
     return "; ".join(messages) or "LeetCode returned a GraphQL error"
 
 
-def graphql_request(
-    page: Any,
-    operation_name: str,
-    query: str,
-    variables: Mapping[str, Any],
-) -> Mapping[str, Any]:
-    payload = {
-        "operationName": operation_name,
-        "query": query,
-        "variables": dict(variables),
-    }
-    cookies = page.context.cookies([LEETCODE_URL])
-    csrf_token = next(
-        (cookie["value"] for cookie in cookies if cookie["name"] == "csrftoken"),
-        "",
-    )
-    headers = {
-        "Accept": "application/json",
-        "Content-Type": "application/json",
-        "Origin": LEETCODE_URL,
-        "Referer": f"{LEETCODE_URL}/",
-    }
-    if csrf_token:
-        headers["x-csrftoken"] = csrf_token
+class LeetCodeClient:
+    def __init__(
+        self,
+        session: Any,
+        session_cookie: str,
+        request_delay_seconds: float,
+    ) -> None:
+        self._session = session
+        self._cookies = {LEETCODE_SESSION_COOKIE: session_cookie}
+        self._request_delay_seconds = request_delay_seconds
+        self._pace_lock = asyncio.Lock()
+        self._next_request_at = 0.0
 
-    for attempt in range(GRAPHQL_RETRIES):
-        response = page.context.request.post(
-            GRAPHQL_URL,
-            data=payload,
-            headers=headers,
-            timeout=30_000,
-        )
-        status = response.status
-        if status == 429 or 500 <= status < 600:
-            if attempt == GRAPHQL_RETRIES - 1:
-                raise CrawlerError(
-                    f"LeetCode API returned HTTP {status} after "
-                    f"{GRAPHQL_RETRIES} attempts"
-                )
-            retry_after = response.headers.get("retry-after", "")
-            try:
-                delay = min(float(retry_after), 60.0)
-            except ValueError:
-                delay = min(2**attempt, 30)
-            time.sleep(max(delay, 0.5))
-            continue
-        if status in (401, 403):
-            raise CrawlerError(
-                "LeetCode rejected the authenticated API request. "
-                "Sign in again and complete any browser verification."
+    async def _pace_request(self) -> None:
+        loop = asyncio.get_running_loop()
+        while True:
+            async with self._pace_lock:
+                now = loop.time()
+                wait_seconds = self._next_request_at - now
+                if wait_seconds <= 0:
+                    self._next_request_at = now + self._request_delay_seconds
+                    return
+            await asyncio.sleep(wait_seconds)
+
+    async def _defer_requests(self, delay_seconds: float) -> None:
+        loop = asyncio.get_running_loop()
+        async with self._pace_lock:
+            self._next_request_at = max(
+                self._next_request_at,
+                loop.time() + delay_seconds,
             )
-        if not response.ok:
-            raise CrawlerError(f"LeetCode API returned HTTP {status}")
 
-        try:
-            result = response.json()
-        except (json.JSONDecodeError, ValueError) as exc:
-            raise CrawlerError(
-                "LeetCode returned a non-JSON API response; browser verification "
-                "may still be pending"
-            ) from exc
-        if not isinstance(result, Mapping):
-            raise CrawlerError("LeetCode returned an invalid GraphQL response")
-        if result.get("errors"):
-            raise CrawlerError(_graphql_error_message(result))
-        data = result.get("data")
-        if not isinstance(data, Mapping):
-            raise CrawlerError("LeetCode GraphQL response did not contain data")
-        return data
+    async def graphql_request(
+        self,
+        operation_name: str,
+        query: str,
+        variables: Mapping[str, Any],
+    ) -> Mapping[str, Any]:
+        payload = {
+            "operationName": operation_name,
+            "query": query,
+            "variables": dict(variables),
+        }
 
-    raise AssertionError("unreachable")
+        for attempt in range(GRAPHQL_RETRIES):
+            await self._pace_request()
+            try:
+                response = await self._session.post(
+                    GRAPHQL_URL,
+                    json=payload,
+                    cookies=self._cookies,
+                    discard_cookies=True,
+                )
+            except RequestException as exc:
+                if attempt == GRAPHQL_RETRIES - 1:
+                    raise CrawlerError(
+                        f"LeetCode request {operation_name!r} failed after "
+                        f"{GRAPHQL_RETRIES} attempts: {exc}"
+                    ) from exc
+                await asyncio.sleep(min(2**attempt, 30))
+                continue
+
+            status = response.status_code
+            if status == 429 or 500 <= status < 600:
+                if attempt == GRAPHQL_RETRIES - 1:
+                    raise CrawlerError(
+                        f"LeetCode API returned HTTP {status} after "
+                        f"{GRAPHQL_RETRIES} attempts"
+                    )
+                retry_after = response.headers.get("retry-after", "")
+                try:
+                    delay = min(float(retry_after), 60.0)
+                except ValueError:
+                    delay = min(2**attempt, 30)
+                delay = max(delay, 0.5)
+                if status == 429 or retry_after:
+                    await self._defer_requests(delay)
+                else:
+                    await asyncio.sleep(delay)
+                continue
+            if status in (401, 403):
+                raise CrawlerError(
+                    "LeetCode rejected the authenticated API request. "
+                    "Sign in again and complete any browser verification."
+                )
+            if not response.ok:
+                raise CrawlerError(f"LeetCode API returned HTTP {status}")
+
+            try:
+                result = response.json()
+            except (json.JSONDecodeError, ValueError) as exc:
+                raise CrawlerError(
+                    "LeetCode returned a non-JSON API response; browser verification "
+                    "may still be pending"
+                ) from exc
+            if not isinstance(result, Mapping):
+                raise CrawlerError("LeetCode returned an invalid GraphQL response")
+            if result.get("errors"):
+                raise CrawlerError(_graphql_error_message(result))
+            data = result.get("data")
+            if not isinstance(data, Mapping):
+                raise CrawlerError("LeetCode GraphQL response did not contain data")
+            return data
+
+        raise AssertionError("unreachable")
 
 
-def fetch_solved_questions(page: Any) -> list[SolvedQuestion]:
+async def fetch_solved_questions(client: LeetCodeClient) -> list[SolvedQuestion]:
     questions: list[SolvedQuestion] = []
     skip = 0
     while True:
-        data = graphql_request(
-            page,
+        data = await client.graphql_request(
             "userProgressQuestionList",
             USER_PROGRESS_QUERY,
             {
@@ -552,9 +608,10 @@ def fetch_solved_questions(page: Any) -> list[SolvedQuestion]:
     return questions
 
 
-def fetch_latest_accepted_submission(page: Any, title_slug: str) -> Submission:
-    data = graphql_request(
-        page,
+async def fetch_latest_accepted_submission(
+    client: LeetCodeClient, title_slug: str
+) -> Submission:
+    data = await client.graphql_request(
         "submissionList",
         SUBMISSION_LIST_QUERY,
         {
@@ -590,9 +647,10 @@ def fetch_latest_accepted_submission(page: Any, title_slug: str) -> Submission:
         ) from exc
 
 
-def fetch_submission_code(page: Any, submission_id: int) -> tuple[str, int | None]:
-    data = graphql_request(
-        page,
+async def fetch_submission_code(
+    client: LeetCodeClient, submission_id: int
+) -> tuple[str, int | None]:
+    data = await client.graphql_request(
         "submissionDetails",
         SUBMISSION_DETAILS_QUERY,
         {"submissionId": submission_id},
@@ -616,9 +674,26 @@ def fetch_submission_code(page: Any, submission_id: int) -> tuple[str, int | Non
 
 def has_leetcode_session(cookies: Iterable[Mapping[str, Any]]) -> bool:
     return any(
-        cookie.get("name") == "LEETCODE_SESSION" and cookie.get("value")
+        cookie.get("name") == LEETCODE_SESSION_COOKIE and cookie.get("value")
         for cookie in cookies
     )
+
+
+def extract_leetcode_session(cookies: Iterable[Mapping[str, Any]]) -> str:
+    session_cookie = next(
+        (
+            str(cookie.get("value"))
+            for cookie in cookies
+            if cookie.get("name") == LEETCODE_SESSION_COOKIE
+            and cookie.get("value")
+        ),
+        "",
+    )
+    if not session_cookie:
+        raise CrawlerError(
+            "LeetCode login completed without an authenticated session cookie"
+        )
+    return session_cookie
 
 
 def credential_error(messages: Iterable[str]) -> str | None:
@@ -903,60 +978,113 @@ def git_push(repo_path: Path) -> bool:
     return True
 
 
-def crawl(
-    page: Any, settings: Settings, checkpoint: int
+async def download_questions(
+    client: LeetCodeClient,
+    settings: Settings,
+    questions: Sequence[SolvedQuestion],
 ) -> tuple[list[Path], int, int]:
-    solved_questions = fetch_solved_questions(page)
+    semaphore = asyncio.Semaphore(settings.concurrent_downloads)
+    progress_lock = asyncio.Lock()
+    completed_count = 0
+
+    async def download(
+        question: SolvedQuestion,
+    ) -> tuple[Path, bool, int]:
+        nonlocal completed_count
+        async with semaphore:
+            submission = await fetch_latest_accepted_submission(
+                client, question.title_slug
+            )
+            code, detail_timestamp = await fetch_submission_code(
+                client, submission.submission_id
+            )
+            timestamp = detail_timestamp or submission.timestamp
+            filename = submission_filename(
+                question.frontend_id, timestamp, submission.language
+            )
+            path = settings.submissions_path / filename
+            updated = write_submission(path, code)
+
+        async with progress_lock:
+            completed_count += 1
+            print(
+                f"[{completed_count}/{len(questions)}] Downloaded "
+                f"{question.frontend_id}. {question.title}"
+            )
+        return path, updated, timestamp
+
+    results = await asyncio.gather(*(download(question) for question in questions))
+    submission_files = [path for path, _, _ in results]
+    updated_count = sum(updated for _, updated, _ in results)
+    watermark = max((timestamp for _, _, timestamp in results), default=0)
+    return submission_files, updated_count, watermark
+
+
+async def crawl(
+    client: LeetCodeClient, settings: Settings, checkpoint: int
+) -> tuple[list[Path], int, int]:
+    solved_questions = await fetch_solved_questions(client)
     changed_questions, watermark = questions_since(solved_questions, checkpoint)
     print(
         f"Found {len(solved_questions)} solved problems; "
         f"{len(changed_questions)} changed since the last successful run."
     )
 
-    submission_files: list[Path] = []
-    updated_count = 0
-    for index, question in enumerate(changed_questions, start=1):
-        print(
-            f"[{index}/{len(changed_questions)}] Downloading "
-            f"{question.frontend_id}. {question.title}"
-        )
-        submission = fetch_latest_accepted_submission(page, question.title_slug)
-        if settings.request_delay_seconds:
-            time.sleep(settings.request_delay_seconds)
-        code, detail_timestamp = fetch_submission_code(
-            page, submission.submission_id
-        )
-        timestamp = detail_timestamp or submission.timestamp
-        watermark = max(watermark, timestamp)
-        filename = submission_filename(
-            question.frontend_id, timestamp, submission.language
-        )
-        path = settings.submissions_path / filename
-        submission_files.append(path)
-        if write_submission(path, code):
-            updated_count += 1
-        if settings.request_delay_seconds:
-            time.sleep(settings.request_delay_seconds)
-
-    return submission_files, updated_count, watermark
+    submission_files, updated_count, download_watermark = await download_questions(
+        client, settings, changed_questions
+    )
+    return submission_files, updated_count, max(watermark, download_watermark)
 
 
-def run_check(page: Any) -> None:
-    solved_questions = fetch_solved_questions(page)
+async def run_check(client: LeetCodeClient) -> None:
+    solved_questions = await fetch_solved_questions(client)
     if not solved_questions:
         print("Authenticated API check succeeded; this account has no solved problems.")
         return
     latest_question = max(
         solved_questions, key=lambda question: question.last_submitted_at or 0
     )
-    submission = fetch_latest_accepted_submission(page, latest_question.title_slug)
-    code, _ = fetch_submission_code(page, submission.submission_id)
+    submission = await fetch_latest_accepted_submission(
+        client, latest_question.title_slug
+    )
+    code, _ = await fetch_submission_code(client, submission.submission_id)
     if not code:
         raise CrawlerError("LeetCode returned an empty solution during the API check")
     print(
         "Authenticated API check succeeded: "
         f"{len(solved_questions)} solved problems found and solution download verified."
     )
+
+
+async def run_authenticated(
+    session_cookie: str,
+    settings: Settings,
+    checkpoint: int,
+    check_only: bool,
+) -> tuple[list[Path], int, int] | None:
+    from curl_cffi.requests import AsyncSession
+
+    headers = {
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "Origin": LEETCODE_URL,
+        "Referer": f"{LEETCODE_URL}/",
+    }
+    async with AsyncSession(
+        headers=headers,
+        impersonate="chrome",
+        max_clients=settings.concurrent_downloads,
+        timeout=30,
+    ) as session:
+        client = LeetCodeClient(
+            session,
+            session_cookie,
+            settings.request_delay_seconds,
+        )
+        if check_only:
+            await run_check(client)
+            return None
+        return await crawl(client, settings, checkpoint)
 
 
 def launch_browser_context(playwright: Any, settings: Settings) -> Any:
@@ -997,8 +1125,8 @@ def execute(args: argparse.Namespace) -> None:
     from patchright.sync_api import sync_playwright
 
     # Patchright removes Playwright's CDP and command-line fingerprint leaks.
-    # The persistent, unmodified Chrome profile keeps the human-created session
-    # without injecting a synthetic user agent or browser headers.
+    # The persistent Chrome profile is used only to create or refresh the human
+    # session. Bulk requests receive only its LEETCODE_SESSION cookie.
     with sync_playwright() as playwright:
         context = launch_browser_context(playwright, settings)
         try:
@@ -1006,25 +1134,9 @@ def execute(args: argparse.Namespace) -> None:
             page.set_default_timeout(30_000)
             try:
                 login(page, settings)
-
-                if args.check:
-                    run_check(page)
-                    return
-
-                submission_files, updated_count, watermark = crawl(
-                    page, settings, checkpoint
+                session_cookie = extract_leetcode_session(
+                    context.cookies([LEETCODE_URL])
                 )
-                committed = git_commit(settings.submissions_path, submission_files)
-                if settings.push:
-                    git_push(settings.submissions_path)
-
-                if watermark > checkpoint:
-                    save_checkpoint(config, settings.config_path, watermark)
-
-                noun = "submission" if updated_count == 1 else "submissions"
-                print(f"{updated_count} {noun} updated.")
-                if committed:
-                    print("Created a Git commit for the updated submissions.")
             except BrowserError as exc:
                 detail = str(exc).strip() or type(exc).__name__
                 if "target page, context or browser has been closed" in detail.lower():
@@ -1034,6 +1146,25 @@ def execute(args: argparse.Namespace) -> None:
                 raise CrawlerError(detail) from exc
         finally:
             context.close()
+
+    result = asyncio.run(
+        run_authenticated(session_cookie, settings, checkpoint, args.check)
+    )
+    if result is None:
+        return
+
+    submission_files, updated_count, watermark = result
+    committed = git_commit(settings.submissions_path, submission_files)
+    if settings.push:
+        git_push(settings.submissions_path)
+
+    if watermark > checkpoint:
+        save_checkpoint(config, settings.config_path, watermark)
+
+    noun = "submission" if updated_count == 1 else "submissions"
+    print(f"{updated_count} {noun} updated.")
+    if committed:
+        print("Created a Git commit for the updated submissions.")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1071,6 +1202,15 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Playwright browser channel (for example chrome); use an empty "
             "value for Chromium"
+        ),
+    )
+    parser.add_argument(
+        "--concurrency",
+        type=int,
+        default=None,
+        help=(
+            "maximum concurrent solution downloads "
+            f"(1-{MAX_CONCURRENT_DOWNLOADS})"
         ),
     )
     parser.add_argument(

@@ -5,6 +5,7 @@ description = "Download accepted LeetCode solutions and optionally commit and pu
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
+    "curl-cffi==0.16.0",
     "patchright==1.61.2",
     "pytest>=8,<9",
     "pytest-mock>=3.14,<4",
