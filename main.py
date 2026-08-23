@@ -984,8 +984,7 @@ def launch_browser_context(playwright: Any, settings: Settings) -> Any:
             return playwright.chromium.launch_persistent_context(**options)
         except Exception as second_error:
             raise CrawlerError(
-                "Could not launch Chrome or Patchright Chromium. Run "
-                "`pixi run install-browser`."
+                f"Could not launch Patchright Chromium: {second_error}"
             ) from second_error
 
 

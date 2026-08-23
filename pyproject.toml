@@ -20,6 +20,6 @@ platforms = [
 ]
 
 [tool.pixi.tasks]
-crawler = "python main.py"
+crawler = { cmd = "python main.py", depends-on = ["install-browser"] }
 install-browser = "patchright install chromium"
 test = "python -m unittest discover -s tests -v"
