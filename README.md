@@ -25,17 +25,9 @@ git init submissions
 # or: git clone <your-remote-repository> submissions
 ```
 
-The crawler performs its automatic Git operations through `pygit2`; it does
-not invoke the Git command-line executable.
-
-Pixi resolves `pygit2` for the selected environment platform, which is not
-necessarily the same as the Windows host architecture. On this Windows ARM64
-machine, `pixi list` reports a `win-64` environment: it uses conda-forge's
-`pygit2`, `libgit2`, and `libssh2` packages, and its installed `pygit2` reports
-SSH transport support. A native `win-arm64` solve instead uses the configured
-PyPI fallback because conda-forge does not publish `pygit2` for that target;
-the crawler warns and skips a push if that runtime lacks the requested remote
-transport.
+Automatic pushes support HTTPS and SSH remotes. If a requested push cannot be
+performed, the crawler warns and preserves the checkpoint so it can retry on a
+later run.
 
 For HTTPS remotes, set `PYGIT2_USERNAME` and `PYGIT2_PASSWORD` when the remote
 requires credentials. SSH agent authentication works automatically. To use a
