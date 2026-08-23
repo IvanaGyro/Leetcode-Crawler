@@ -28,10 +28,14 @@ git init submissions
 The crawler performs its automatic Git operations through `pygit2`; it does
 not invoke the Git command-line executable.
 
-Pixi installs `pygit2` and `libssh2` from conda-forge on Linux, macOS, and
-Windows x64, so SSH remotes work there. Conda-forge does not publish a
-`pygit2` build for Windows ARM64, so that platform uses the PyPI wheel instead;
-if its remote transport is unavailable, the crawler warns and skips the push.
+Pixi resolves `pygit2` for the selected environment platform, which is not
+necessarily the same as the Windows host architecture. On this Windows ARM64
+machine, `pixi list` reports a `win-64` environment: it uses conda-forge's
+`pygit2`, `libgit2`, and `libssh2` packages, and its installed `pygit2` reports
+SSH transport support. A native `win-arm64` solve instead uses the configured
+PyPI fallback because conda-forge does not publish `pygit2` for that target;
+the crawler warns and skips a push if that runtime lacks the requested remote
+transport.
 
 For HTTPS remotes, set `PYGIT2_USERNAME` and `PYGIT2_PASSWORD` when the remote
 requires credentials. SSH agent authentication works automatically. To use a
