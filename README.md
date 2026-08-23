@@ -5,22 +5,9 @@ it under `submissions/`, and optionally commit and push the changed files.
 
 ## Requirements
 
-- Python 3.10 or newer
+- [Pixi](https://pixi.prefix.dev/)
 - Git (only needed for automatic commits and pushes)
 - Chrome, or Patchright's Chromium browser
-
-## Installation
-
-```powershell
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-python -m pip install -r requirements.txt
-python -m patchright install chromium
-```
-
-The last command provides a fallback browser. By default the crawler first uses
-the installed Chrome channel through Patchright and keeps its authenticated
-session in the ignored `.browser-profile/` directory.
 
 ## Configuration
 
@@ -39,7 +26,7 @@ git init submissions
 ## Usage
 
 ```powershell
-python main.py
+pixi run crawler
 ```
 
 LeetCode may show a CAPTCHA or Turnstile challenge. Complete it in the opened
@@ -50,17 +37,23 @@ Useful options:
 
 ```powershell
 # Verify authentication and all three GraphQL queries without writing anything
-python main.py --check --no-push
+pixi run crawler --check --no-push
 
 # Download files without pushing them
-python main.py --no-push
+pixi run crawler --no-push
 
 # Enter credentials and complete verification manually in the opened browser
-python main.py --manual-login --no-push
+pixi run crawler --manual-login --no-push
 
 # CI mode (credentials must be in config.ini or environment variables)
-python main.py --headless --non-interactive
+pixi run crawler --headless --non-interactive
 ```
 
 The checkpoint advances only after every requested solution is downloaded and
 the configured Git operation succeeds. A failed run is therefore safe to retry.
+
+## Testing
+
+```powershell
+pixi run test
+```
