@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 import main
 import pygit2
+import pytest
 
 
 def test_parse_timestamp_accepts_epoch_and_iso():
@@ -475,7 +476,7 @@ def test_push_without_remote_warns_and_is_skipped(tmp_path, capsys):
     assert "no configured remote" in stderr
 
 
-def test_scp_style_remote_uses_anonymous_ssh_transport(tmp_path):
+def test_scp_style_remote_preserves_relative_path_semantics(tmp_path):
     repository = _create_repository(tmp_path)
     remote = repository.remotes.create(
         "origin", "git@example.com:owner/submissions.git"
@@ -484,7 +485,7 @@ def test_scp_style_remote_uses_anonymous_ssh_transport(tmp_path):
     transport = main._push_transport(repository, remote)
 
     assert remote.url == "git@example.com:owner/submissions.git"
-    assert transport.url == "ssh://git@example.com/owner/submissions.git"
+    assert transport is remote
 
 
 def test_push_warns_when_pygit2_lacks_remote_protocol_support(
@@ -525,3 +526,234 @@ def test_push_uses_a_configured_remote_and_sets_upstream(tmp_path):
     ].target
     assert pushed == repository.head.target
     assert branch.upstream_name == f"refs/remotes/{remote.name}/{branch.branch_name}"
+
+
+def _set_upstream(
+    repository: pygit2.Repository,
+    remote: pygit2.Remote,
+    branch: pygit2.Branch,
+    upstream_name: str,
+) -> pygit2.Branch:
+    repository.references.create(
+        f"refs/remotes/{remote.name}/{upstream_name}",
+        repository.head.target,
+        force=True,
+    )
+    upstream = repository.branches.get(f"{remote.name}/{upstream_name}")
+    assert upstream is not None
+    branch.upstream = upstream
+    return upstream
+
+
+def test_push_remote_overrides_take_precedence_over_upstream(tmp_path):
+    repository = _create_repository(tmp_path)
+    answer = tmp_path / "answer.py"
+    answer.write_text("answer", encoding="utf-8")
+    _commit_file(repository, answer, "answer")
+    branch = repository.branches.get(repository.head.shorthand)
+    assert branch is not None
+    origin = repository.remotes.create("origin", str(tmp_path / "origin.git"))
+    default_remote = repository.remotes.create(
+        "default", str(tmp_path / "default.git")
+    )
+    branch_remote = repository.remotes.create(
+        "fork", str(tmp_path / "fork.git")
+    )
+    _set_upstream(repository, origin, branch, branch.branch_name)
+
+    repository.config["remote.pushDefault"] = default_remote.name
+    selected, _ = main._push_remote(repository, branch)
+    assert selected.name == default_remote.name
+
+    repository.config[f"branch.{branch.branch_name}.pushRemote"] = branch_remote.name
+    selected, _ = main._push_remote(repository, branch)
+    assert selected.name == branch_remote.name
+
+
+def test_push_refuses_mismatched_upstream_branch_by_default(tmp_path):
+    repository = _create_repository(tmp_path)
+    remote_path = tmp_path / "remote.git"
+    pygit2.init_repository(str(remote_path), bare=True)
+    answer = tmp_path / "answer.py"
+    answer.write_text("answer", encoding="utf-8")
+    _commit_file(repository, answer, "answer")
+    branch = repository.branches.get(repository.head.shorthand)
+    assert branch is not None
+    remote = repository.remotes.create("origin", str(remote_path))
+    _set_upstream(repository, remote, branch, "deploy")
+
+    with pytest.raises(main.CrawlerError, match="different name"):
+        main.git_push(repository, tmp_path)
+
+
+def test_push_default_upstream_uses_the_remote_tracking_branch_name(tmp_path):
+    repository = _create_repository(tmp_path)
+    remote_path = tmp_path / "remote.git"
+    remote_repository = pygit2.init_repository(str(remote_path), bare=True)
+    answer = tmp_path / "answer.py"
+    answer.write_text("answer", encoding="utf-8")
+    _commit_file(repository, answer, "answer")
+    branch = repository.branches.get(repository.head.shorthand)
+    assert branch is not None
+    remote = repository.remotes.create("origin", str(remote_path))
+    _set_upstream(repository, remote, branch, "deploy")
+    repository.config["push.default"] = "upstream"
+
+    assert main.git_push(repository, tmp_path)
+
+    assert remote_repository.references["refs/heads/deploy"].target == repository.head.target
+    with pytest.raises(KeyError):
+        remote_repository.references["refs/heads/origin/deploy"]
+
+
+def test_push_reuses_an_existing_upstream_without_a_remote_prefix(tmp_path):
+    repository = _create_repository(tmp_path)
+    remote_path = tmp_path / "remote.git"
+    remote_repository = pygit2.init_repository(str(remote_path), bare=True)
+    answer = tmp_path / "answer.py"
+    answer.write_text("answer", encoding="utf-8")
+    _commit_file(repository, answer, "answer")
+    branch = repository.branches.get(repository.head.shorthand)
+    assert branch is not None
+    repository.remotes.create("origin", str(remote_path))
+
+    assert main.git_push(repository, tmp_path)
+    answer.write_text("updated answer", encoding="utf-8")
+    _commit_file(repository, answer, "updated answer")
+    assert main.git_push(repository, tmp_path)
+
+    assert (
+        remote_repository.references[f"refs/heads/{branch.branch_name}"].target
+        == repository.head.target
+    )
+    with pytest.raises(KeyError):
+        remote_repository.references[f"refs/heads/origin/{branch.branch_name}"]
+
+
+def test_push_honors_configured_remote_push_refspecs(tmp_path):
+    repository = _create_repository(tmp_path)
+    remote_path = tmp_path / "remote.git"
+    remote_repository = pygit2.init_repository(str(remote_path), bare=True)
+    answer = tmp_path / "answer.py"
+    answer.write_text("answer", encoding="utf-8")
+    _commit_file(repository, answer, "answer")
+    branch = repository.branches.get(repository.head.shorthand)
+    assert branch is not None
+    repository.remotes.create("origin", str(remote_path))
+    repository.config["remote.origin.push"] = f"{branch.name}:refs/heads/deploy"
+
+    assert main.git_push(repository, tmp_path)
+
+    assert remote_repository.references["refs/heads/deploy"].target == repository.head.target
+
+
+def test_push_updates_every_configured_push_url(tmp_path):
+    repository = _create_repository(tmp_path)
+    first_remote_path = tmp_path / "first.git"
+    second_remote_path = tmp_path / "second.git"
+    first_remote = pygit2.init_repository(str(first_remote_path), bare=True)
+    second_remote = pygit2.init_repository(str(second_remote_path), bare=True)
+    answer = tmp_path / "answer.py"
+    answer.write_text("answer", encoding="utf-8")
+    _commit_file(repository, answer, "answer")
+    branch = repository.branches.get(repository.head.shorthand)
+    assert branch is not None
+    repository.remotes.create("origin", first_remote_path.as_posix())
+    repository.config["remote.origin.pushurl"] = first_remote_path.as_posix()
+    repository.config.set_multivar(
+        "remote.origin.pushurl", "^$", second_remote_path.as_posix()
+    )
+
+    assert main.git_push(repository, tmp_path)
+
+    refname = f"refs/heads/{branch.branch_name}"
+    assert first_remote.references[refname].target == repository.head.target
+    assert second_remote.references[refname].target == repository.head.target
+
+
+def test_commit_refuses_ignored_submission_files(tmp_path):
+    repository = _create_repository(tmp_path)
+    (tmp_path / ".gitignore").write_text("*.py\n", encoding="utf-8")
+    answer = tmp_path / "answer.py"
+    answer.write_text("answer", encoding="utf-8")
+
+    with pytest.raises(main.CrawlerError, match="ignored by repository rules"):
+        main.git_commit(repository, [answer])
+
+
+def test_commit_fails_clearly_when_a_commit_hook_is_configured(tmp_path):
+    repository = _create_repository(tmp_path)
+    hooks_path = Path(repository.path) / "hooks"
+    hooks_path.mkdir(exist_ok=True)
+    (hooks_path / "pre-commit").write_text("#!/bin/sh\n", encoding="utf-8")
+    answer = tmp_path / "answer.py"
+    answer.write_text("answer", encoding="utf-8")
+
+    with pytest.raises(main.CrawlerError, match="pre-commit hook"):
+        main.git_commit(repository, [answer])
+
+
+def test_commit_fails_clearly_when_signing_is_required(tmp_path):
+    repository = _create_repository(tmp_path)
+    repository.config["commit.gpgSign"] = "true"
+    answer = tmp_path / "answer.py"
+    answer.write_text("answer", encoding="utf-8")
+
+    with pytest.raises(main.CrawlerError, match="signing is enabled"):
+        main.git_commit(repository, [answer])
+
+
+def test_push_fails_clearly_when_a_pre_push_hook_is_configured(tmp_path):
+    repository = _create_repository(tmp_path)
+    remote_path = tmp_path / "remote.git"
+    pygit2.init_repository(str(remote_path), bare=True)
+    answer = tmp_path / "answer.py"
+    answer.write_text("answer", encoding="utf-8")
+    _commit_file(repository, answer, "answer")
+    repository.remotes.create("origin", str(remote_path))
+    hooks_path = Path(repository.path) / "hooks"
+    hooks_path.mkdir(exist_ok=True)
+    (hooks_path / "pre-push").write_text("#!/bin/sh\n", encoding="utf-8")
+
+    with pytest.raises(main.CrawlerError, match="pre-push hook"):
+        main.git_push(repository, tmp_path)
+
+
+def test_push_callback_uses_explicit_https_credentials(monkeypatch, mocker):
+    sentinel = object()
+    userpass = mocker.patch.object(
+        main.pygit2, "UserPass", return_value=sentinel
+    )
+    monkeypatch.setenv(main.PYGIT2_USERNAME_ENV, "token-user")
+    monkeypatch.setenv(main.PYGIT2_PASSWORD_ENV, "token-value")
+
+    credentials = main._PushCallbacks().credentials(
+        "https://example.invalid/repository.git",
+        None,
+        pygit2.enums.CredentialType.USERPASS_PLAINTEXT,
+    )
+
+    assert credentials is sentinel
+    userpass.assert_called_once_with("token-user", "token-value")
+
+
+def test_push_callback_uses_an_explicit_ssh_key(tmp_path, monkeypatch, mocker):
+    private_key = tmp_path / "id_ed25519"
+    public_key = tmp_path / "id_ed25519.pub"
+    private_key.write_text("private", encoding="utf-8")
+    public_key.write_text("public", encoding="utf-8")
+    sentinel = object()
+    keypair = mocker.patch.object(
+        main.pygit2, "Keypair", return_value=sentinel
+    )
+    monkeypatch.setenv(main.PYGIT2_SSH_KEY_PATH_ENV, str(private_key))
+    monkeypatch.setenv(main.PYGIT2_SSH_PUBLIC_KEY_PATH_ENV, str(public_key))
+
+    credentials = main._PushCallbacks().credentials(
+        "ssh://git@example.invalid/repository.git",
+        "git",
+        pygit2.enums.CredentialType.SSH_KEY,
+    )
+
+    assert credentials is sentinel
+    keypair.assert_called_once_with("git", str(public_key), str(private_key), "")

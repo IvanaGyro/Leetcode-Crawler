@@ -57,9 +57,11 @@ LOGIN_ERROR_PHRASES = (
     "account has been locked",
 )
 
-SCP_STYLE_SSH_URL = re.compile(
-    r"^(?P<user_host>(?:[^@/:\\]+@)?[^/:\\]+):(?P<path>.+)$"
-)
+PYGIT2_USERNAME_ENV = "PYGIT2_USERNAME"
+PYGIT2_PASSWORD_ENV = "PYGIT2_PASSWORD"
+PYGIT2_SSH_KEY_PATH_ENV = "PYGIT2_SSH_KEY_PATH"
+PYGIT2_SSH_PUBLIC_KEY_PATH_ENV = "PYGIT2_SSH_PUBLIC_KEY_PATH"
+PYGIT2_SSH_PASSPHRASE_ENV = "PYGIT2_SSH_PASSPHRASE"
 
 
 USER_PROGRESS_QUERY = """
@@ -943,6 +945,28 @@ def _relative_submission_files(
     return sorted(relative_files)
 
 
+def _configured_hook(
+    repository: pygit2.Repository, hook_names: Sequence[str]
+) -> str | None:
+    hooks_path = Path(repository.path) / "hooks"
+    for hook_name in hook_names:
+        if (hooks_path / hook_name).is_file():
+            return hook_name
+    return None
+
+
+def _commit_signing_is_enabled(repository: pygit2.Repository) -> bool:
+    try:
+        return repository.config.get_bool("commit.gpgSign")
+    except KeyError:
+        return False
+    except (ValueError, pygit2.GitError) as exc:
+        raise CrawlerError(
+            "Git commit signing configuration is invalid in the submission "
+            f"repository: {exc}"
+        ) from exc
+
+
 def git_commit(
     repository: pygit2.Repository, updated_files: Sequence[Path]
 ) -> bool:
@@ -951,6 +975,30 @@ def git_commit(
         return False
 
     relative_files = _relative_submission_files(repository, updated_files)
+    try:
+        ignored_files = [
+            path for path in relative_files if repository.path_is_ignored(path)
+        ]
+    except pygit2.GitError as exc:
+        raise CrawlerError(f"Git could not inspect ignored files: {exc}") from exc
+    if ignored_files:
+        raise CrawlerError(
+            "Git could not stage the updated submissions because they are "
+            "ignored by repository rules: " + ", ".join(ignored_files)
+        )
+
+    hook_name = _configured_hook(repository, ("pre-commit", "commit-msg"))
+    if hook_name is not None:
+        raise CrawlerError(
+            f"Git commit cannot run the configured {hook_name} hook with "
+            "pygit2; commit manually or remove the hook."
+        )
+    if _commit_signing_is_enabled(repository):
+        raise CrawlerError(
+            "Git commit signing is enabled, but pygit2 cannot create a "
+            "signed commit; commit manually or disable commit.gpgSign."
+        )
+
     try:
         worktree_index = repository.index
         for path in relative_files:
@@ -992,13 +1040,43 @@ def git_commit(
     return True
 
 
+def _branch_upstream(branch: pygit2.Branch) -> pygit2.Branch | None:
+    try:
+        return branch.upstream
+    except (KeyError, ValueError, pygit2.GitError):
+        return None
+
+
+def _configured_remote(
+    repository: pygit2.Repository, config_key: str
+) -> pygit2.Remote | None:
+    try:
+        remote_name = str(repository.config[config_key]).strip()
+    except KeyError:
+        return None
+    if not remote_name:
+        return None
+    try:
+        return repository.remotes[remote_name]
+    except KeyError as exc:
+        raise CrawlerError(
+            f"Git push failed: configured remote {remote_name!r} does not exist"
+        ) from exc
+
+
 def _push_remote(
     repository: pygit2.Repository, branch: pygit2.Branch
 ) -> tuple[pygit2.Remote, pygit2.Branch | None] | None:
-    try:
-        upstream = branch.upstream
-    except (KeyError, ValueError, pygit2.GitError):
-        upstream = None
+    upstream = _branch_upstream(branch)
+
+    for config_key in (
+        f"branch.{branch.branch_name}.pushRemote",
+        "remote.pushDefault",
+    ):
+        remote = _configured_remote(repository, config_key)
+        if remote is not None:
+            return remote, upstream
+
     if upstream is not None:
         try:
             return repository.remotes[upstream.remote_name], upstream
@@ -1006,45 +1084,159 @@ def _push_remote(
             pass
 
     try:
-        remote_name = str(repository.config["remote.pushDefault"])
-        return repository.remotes[remote_name], None
-    except KeyError:
-        pass
-
-    try:
-        return repository.remotes["origin"], None
+        return repository.remotes["origin"], upstream
     except KeyError:
         remotes = list(repository.remotes)
-        return (remotes[0], None) if len(remotes) == 1 else None
+        return (remotes[0], upstream) if len(remotes) == 1 else None
+
+
+def _push_urls(repository: pygit2.Repository, remote: pygit2.Remote) -> list[str]:
+    try:
+        push_urls = list(
+            repository.config.get_multivar(f"remote.{remote.name}.pushurl")
+        )
+    except KeyError:
+        push_urls = []
+    return push_urls or [remote.url]
+
+
+def _upstream_destination(
+    remote: pygit2.Remote, upstream: pygit2.Branch
+) -> str:
+    full_prefix = f"refs/remotes/{remote.name}/"
+    if upstream.name.startswith(full_prefix):
+        return upstream.name.removeprefix(full_prefix)
+
+    short_prefix = f"{remote.name}/"
+    if upstream.branch_name.startswith(short_prefix):
+        return upstream.branch_name.removeprefix(short_prefix)
+    return upstream.branch_name
+
+
+def _push_default(repository: pygit2.Repository) -> str:
+    try:
+        value = str(repository.config["push.default"]).strip().lower()
+    except KeyError:
+        return "simple"
+    return value or "simple"
+
+
+def _implicit_push_refspecs(
+    repository: pygit2.Repository,
+    branch: pygit2.Branch,
+    remote: pygit2.Remote,
+    upstream: pygit2.Branch | None,
+) -> tuple[list[str], str, bool]:
+    push_default = _push_default(repository)
+    target_branch = branch.branch_name
+    upstream_matches_remote = (
+        upstream is not None and upstream.remote_name == remote.name
+    )
+
+    if push_default == "nothing":
+        raise CrawlerError(
+            "Git push was requested, but push.default is 'nothing'; push skipped."
+        )
+    if push_default == "matching":
+        raise CrawlerError(
+            "Git push with push.default='matching' is unsupported by the "
+            "pygit2 crawler; configure remote.<name>.push refspecs instead."
+        )
+    if push_default not in {"simple", "current", "upstream", "tracking"}:
+        raise CrawlerError(f"Git push has unsupported push.default={push_default!r}")
+
+    if push_default in {"upstream", "tracking"}:
+        if not upstream_matches_remote or upstream is None:
+            raise CrawlerError(
+                "Git push with push.default='upstream' requires an upstream "
+                "on the selected push remote."
+            )
+        target_branch = _upstream_destination(remote, upstream)
+    elif upstream_matches_remote and upstream is not None:
+        upstream_branch = _upstream_destination(remote, upstream)
+        if push_default == "simple":
+            if upstream_branch != branch.branch_name:
+                raise CrawlerError(
+                    "Git push refused because the checked-out branch "
+                    f"{branch.branch_name!r} tracks {remote.name}/{upstream_branch} "
+                    "with a different name. Configure an explicit "
+                    "remote.<name>.push refspec or push.default='upstream' to "
+                    "allow this mapping."
+                )
+            target_branch = upstream_branch
+
+    return (
+        [f"{branch.name}:refs/heads/{target_branch}"],
+        target_branch,
+        upstream is None,
+    )
+
+
+def _push_refspecs(
+    repository: pygit2.Repository,
+    branch: pygit2.Branch,
+    remote: pygit2.Remote,
+    upstream: pygit2.Branch | None,
+) -> tuple[list[str], str | None, bool]:
+    configured_refspecs = list(remote.push_refspecs)
+    if configured_refspecs:
+        return configured_refspecs, None, False
+    return _implicit_push_refspecs(repository, branch, remote, upstream)
 
 
 def _push_transport(
-    repository: pygit2.Repository, remote: pygit2.Remote
+    repository: pygit2.Repository, remote: pygit2.Remote, url: str | None = None
 ) -> pygit2.Remote:
-    """Create an SSH transport for Git's SCP-style remote URLs when needed."""
-    url = remote.push_url or remote.url
-    if "://" in url or re.match(r"^[A-Za-z]:[\\/]", url):
+    """Return a transport targeting ``url`` without rewriting Git URLs."""
+    target_url = url or remote.push_url or remote.url
+    if target_url == remote.url:
         return remote
-    match = SCP_STYLE_SSH_URL.fullmatch(url)
-    if match is None:
-        return remote
-    normalized_url = (
-        f"ssh://{match.group('user_host')}/"
-        f"{match.group('path').lstrip('/')}"
-    )
-    return repository.remotes.create_anonymous(normalized_url)
+    return repository.remotes.create_anonymous(target_url)
 
 
 class _PushCallbacks(pygit2.RemoteCallbacks):
     def __init__(self) -> None:
         super().__init__()
         self.rejection: str | None = None
+        self.missing_http_credentials = False
+
+    def _ssh_keypair(self, username: str) -> pygit2.Keypair | None:
+        private_key_path = os.environ.get(PYGIT2_SSH_KEY_PATH_ENV)
+        if not private_key_path:
+            return None
+        public_key_path = os.environ.get(
+            PYGIT2_SSH_PUBLIC_KEY_PATH_ENV, f"{private_key_path}.pub"
+        )
+        if not Path(public_key_path).is_file():
+            return None
+        try:
+            return pygit2.Keypair(
+                username,
+                public_key_path,
+                private_key_path,
+                os.environ.get(PYGIT2_SSH_PASSPHRASE_ENV, ""),
+            )
+        except (OSError, ValueError, pygit2.GitError):
+            return None
 
     def credentials(
         self, url: str, username_from_url: str | None, allowed_types: int
-    ) -> pygit2.KeypairFromAgent | pygit2.Username | None:
-        username = username_from_url or getpass.getuser()
+    ) -> pygit2.Keypair | pygit2.KeypairFromAgent | pygit2.UserPass | pygit2.Username | None:
+        username = (
+            username_from_url
+            or os.environ.get(PYGIT2_USERNAME_ENV)
+            or getpass.getuser()
+        )
+        if allowed_types & pygit2.enums.CredentialType.USERPASS_PLAINTEXT:
+            password = os.environ.get(PYGIT2_PASSWORD_ENV)
+            if password:
+                return pygit2.UserPass(username, password)
+            self.missing_http_credentials = True
+            return None
         if allowed_types & pygit2.enums.CredentialType.SSH_KEY:
+            keypair = self._ssh_keypair(username)
+            if keypair is not None:
+                return keypair
             return pygit2.KeypairFromAgent(username)
         if allowed_types & pygit2.enums.CredentialType.USERNAME:
             return pygit2.Username(username)
@@ -1090,14 +1282,24 @@ def git_push(repository: pygit2.Repository, repo_path: Path) -> bool:
         )
         return False
     remote, upstream = push_target
-    target_branch = upstream.branch_name if upstream is not None else branch.branch_name
+    hook_name = _configured_hook(repository, ("pre-push",))
+    if hook_name is not None:
+        raise CrawlerError(
+            f"Git push cannot run the configured {hook_name} hook with pygit2; "
+            "push manually or remove the hook."
+        )
+
+    refspecs, target_branch, set_upstream = _push_refspecs(
+        repository, branch, remote, upstream
+    )
     callbacks = _PushCallbacks()
 
     try:
-        transport = _push_transport(repository, remote)
-        transport.push(
-            [f"{branch.name}:refs/heads/{target_branch}"], callbacks=callbacks
-        )
+        for push_url in _push_urls(repository, remote):
+            transport = _push_transport(repository, remote, push_url)
+            transport.push(refspecs, callbacks=callbacks)
+            if callbacks.rejection is not None:
+                raise CrawlerError(f"Git push failed: {callbacks.rejection}")
     except pygit2.GitError as exc:
         if "unsupported url protocol" in str(exc).lower():
             print(
@@ -1107,11 +1309,15 @@ def git_push(repository: pygit2.Repository, repo_path: Path) -> bool:
                 file=sys.stderr,
             )
             return False
+        if callbacks.missing_http_credentials:
+            raise CrawlerError(
+                "Git push needs HTTPS credentials. Set "
+                f"{PYGIT2_USERNAME_ENV} and {PYGIT2_PASSWORD_ENV}, or use an "
+                "SSH remote."
+            ) from exc
         raise CrawlerError(f"Git push failed: {exc}") from exc
-    if callbacks.rejection is not None:
-        raise CrawlerError(f"Git push failed: {callbacks.rejection}")
 
-    if upstream is None:
+    if set_upstream and target_branch is not None:
         remote_reference = f"refs/remotes/{remote.name}/{target_branch}"
         repository.references.create(
             remote_reference, repository.head.target, force=True

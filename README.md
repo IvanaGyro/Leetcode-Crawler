@@ -28,6 +28,16 @@ git init submissions
 The crawler performs its automatic Git operations through `pygit2`; it does
 not invoke the Git command-line executable.
 
+Pixi installs `pygit2` and `libssh2` from conda-forge on Linux, macOS, and
+Windows x64, so SSH remotes work there. Conda-forge does not publish a
+`pygit2` build for Windows ARM64, so that platform uses the PyPI wheel instead;
+if its remote transport is unavailable, the crawler warns and skips the push.
+
+For HTTPS remotes, set `PYGIT2_USERNAME` and `PYGIT2_PASSWORD` when the remote
+requires credentials. SSH agent authentication works automatically. To use a
+specific SSH key outside the agent, set `PYGIT2_SSH_KEY_PATH` and, if needed,
+`PYGIT2_SSH_PUBLIC_KEY_PATH` and `PYGIT2_SSH_PASSPHRASE`.
+
 ## Usage
 
 ```powershell
@@ -61,7 +71,7 @@ pixi run crawler --headless --non-interactive
 ```
 
 The checkpoint advances only after every requested solution is downloaded and
-the configured Git operation succeeds. A failed run is therefore safe to retry.
+every requested push succeeds. A failed run is therefore safe to retry.
 `ConcurrentDownloads` in `[Browser]` accepts values from 1 through 32;
 `RequestDelaySeconds` is applied globally rather than once per worker.
 
@@ -70,7 +80,14 @@ different repository is not sufficient. If it is not a repository, solutions
 are still written but the crawler warns and skips the commit. When pushing is
 requested but no push target is available (for example, there is no configured
 remote), or its `pygit2` build cannot support the configured remote protocol,
-it warns and skips the push.
+it warns, skips the push, and leaves the checkpoint unchanged.
+
+The crawler preserves push safety rules such as `branch.<name>.pushRemote`,
+`remote.pushDefault`, configured `remote.<name>.push` refspecs, and every
+configured push URL. It does not run Git hooks or create signed commits. When a
+`pre-commit`, `commit-msg`, or `pre-push` hook is configured, or when
+`commit.gpgSign` is enabled, it stops before the Git operation and leaves the
+checkpoint unchanged.
 
 ## Testing
 
