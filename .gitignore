@@ -1,3 +1,9 @@
 .vscode/
 submissions/
 config.ini
+.venv/
+.uv-cache/
+.browser-profile/
+__pycache__/
+*.py[cod]
+.pytest_cache/
