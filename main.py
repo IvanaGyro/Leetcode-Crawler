@@ -985,7 +985,7 @@ def launch_browser_context(playwright: Any, settings: Settings) -> Any:
         except Exception as second_error:
             raise CrawlerError(
                 "Could not launch Chrome or Patchright Chromium. Run "
-                "`python -m patchright install chromium`."
+                "`pixi run install-browser`."
             ) from second_error
 
 
@@ -994,14 +994,8 @@ def execute(args: argparse.Namespace) -> None:
     settings = resolve_settings(args, config)
     checkpoint = get_last_update(config)
 
-    try:
-        from patchright.sync_api import Error as BrowserError
-        from patchright.sync_api import sync_playwright
-    except ImportError as exc:
-        raise CrawlerError(
-            "Patchright is not installed. Run "
-            "`python -m pip install -r requirements.txt`."
-        ) from exc
+    from patchright.sync_api import Error as BrowserError
+    from patchright.sync_api import sync_playwright
 
     # Patchright removes Playwright's CDP and command-line fingerprint leaks.
     # The persistent, unmodified Chrome profile keeps the human-created session

@@ -1,0 +1,25 @@
+[project]
+name = "leetcode-crawler"
+version = "0.1.0"
+description = "Download accepted LeetCode solutions and optionally commit and push them."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "patchright==1.61.2",
+]
+
+[tool.pixi.workspace]
+channels = ["conda-forge"]
+platforms = [
+    "linux-64",
+    "linux-aarch64",
+    "osx-64",
+    "osx-arm64",
+    "win-64",
+    "win-arm64",
+]
+
+[tool.pixi.tasks]
+crawler = "python main.py"
+install-browser = "patchright install chromium"
+test = "python -m unittest discover -s tests -v"
