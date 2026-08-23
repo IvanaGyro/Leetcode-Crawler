@@ -340,15 +340,31 @@ def test_graphql_request_retries_rate_limits(mocker):
         ]
     )
     client = main.LeetCodeClient(session, "session-value", 0)
-    sleep = mocker.patch.object(
-        main.asyncio, "sleep", new=mocker.AsyncMock()
+    defer_requests = mocker.patch.object(
+        client, "_defer_requests", new=mocker.AsyncMock()
     )
 
     data = asyncio.run(client.graphql_request("operation", "query", {}))
 
     assert data == {"answer": 42}
     assert session.post.await_count == 2
-    sleep.assert_awaited_once_with(0.5)
+    defer_requests.assert_awaited_once_with(0.5)
+
+
+def test_global_cooldown_extends_a_pending_request(mocker):
+    async def exercise():
+        client = main.LeetCodeClient(mocker.MagicMock(), "session-value", 0.02)
+        await client._pace_request()
+        pending_request = asyncio.create_task(client._pace_request())
+        await asyncio.sleep(0)
+
+        loop = asyncio.get_running_loop()
+        cooldown_started = loop.time()
+        await client._defer_requests(0.05)
+        await pending_request
+        return loop.time() - cooldown_started
+
+    assert asyncio.run(exercise()) >= 0.04
 
 
 def test_numeric_problem_ids_are_zero_padded():

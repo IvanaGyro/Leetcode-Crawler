@@ -480,14 +480,23 @@ class LeetCodeClient:
         self._next_request_at = 0.0
 
     async def _pace_request(self) -> None:
-        if not self._request_delay_seconds:
-            return
+        loop = asyncio.get_running_loop()
+        while True:
+            async with self._pace_lock:
+                now = loop.time()
+                wait_seconds = self._next_request_at - now
+                if wait_seconds <= 0:
+                    self._next_request_at = now + self._request_delay_seconds
+                    return
+            await asyncio.sleep(wait_seconds)
+
+    async def _defer_requests(self, delay_seconds: float) -> None:
         loop = asyncio.get_running_loop()
         async with self._pace_lock:
-            wait_seconds = self._next_request_at - loop.time()
-            if wait_seconds > 0:
-                await asyncio.sleep(wait_seconds)
-            self._next_request_at = loop.time() + self._request_delay_seconds
+            self._next_request_at = max(
+                self._next_request_at,
+                loop.time() + delay_seconds,
+            )
 
     async def graphql_request(
         self,
@@ -531,7 +540,11 @@ class LeetCodeClient:
                     delay = min(float(retry_after), 60.0)
                 except ValueError:
                     delay = min(2**attempt, 30)
-                await asyncio.sleep(max(delay, 0.5))
+                delay = max(delay, 0.5)
+                if status == 429 or retry_after:
+                    await self._defer_requests(delay)
+                else:
+                    await asyncio.sleep(delay)
                 continue
             if status in (401, 403):
                 raise CrawlerError(
