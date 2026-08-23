@@ -32,6 +32,9 @@ pixi run crawler
 LeetCode may show a CAPTCHA or Turnstile challenge. Complete it in the opened
 browser; the crawler waits up to five minutes by default. Patchright removes
 Playwright's browser fingerprints, but does not solve or click the challenge.
+After login, the browser closes and only the `LEETCODE_SESSION` cookie is handed
+to a browser-impersonating `curl-cffi` client. Solution downloads run concurrently
+while request starts respect the configured delay.
 
 Useful options:
 
@@ -45,12 +48,17 @@ pixi run crawler --no-push
 # Enter credentials and complete verification manually in the opened browser
 pixi run crawler --manual-login --no-push
 
+# Override the default eight concurrent solution downloads
+pixi run crawler --concurrency 4 --no-push
+
 # CI mode (credentials must be in config.ini or environment variables)
 pixi run crawler --headless --non-interactive
 ```
 
 The checkpoint advances only after every requested solution is downloaded and
 the configured Git operation succeeds. A failed run is therefore safe to retry.
+`ConcurrentDownloads` in `[Browser]` accepts values from 1 through 32;
+`RequestDelaySeconds` is applied globally rather than once per worker.
 
 ## Testing
 

@@ -1,3 +1,4 @@
+import asyncio
 import configparser
 import subprocess
 from datetime import datetime
@@ -68,26 +69,79 @@ def test_retry_includes_an_unchanged_file_for_git_recovery(tmp_path, mocker):
         manual_login=False,
     )
     mocker.patch.object(
-        main, "fetch_solved_questions", return_value=[question]
+        main,
+        "fetch_solved_questions",
+        new=mocker.AsyncMock(return_value=[question]),
     )
     mocker.patch.object(
         main,
         "fetch_latest_accepted_submission",
-        return_value=submission,
+        new=mocker.AsyncMock(return_value=submission),
     )
     mocker.patch.object(
         main,
         "fetch_submission_code",
-        return_value=("print('answer')\n", timestamp),
+        new=mocker.AsyncMock(return_value=("print('answer')\n", timestamp)),
     )
 
-    files, updated_count, watermark = main.crawl(
-        mocker.MagicMock(), settings, checkpoint=0
+    files, updated_count, watermark = asyncio.run(
+        main.crawl(mocker.MagicMock(), settings, checkpoint=0)
     )
 
     assert files == [path]
     assert updated_count == 0
     assert watermark == timestamp
+
+
+def test_downloads_use_bounded_concurrency(tmp_path, mocker):
+    questions = [
+        main.SolvedQuestion(str(index), f"Question {index}", str(index), index)
+        for index in range(1, 7)
+    ]
+    active = 0
+    peak = 0
+
+    async def fetch_submission(_client, title_slug):
+        nonlocal active, peak
+        active += 1
+        peak = max(peak, active)
+        await asyncio.sleep(0.01)
+        return main.Submission(int(title_slug), "python3", 1_700_000_000)
+
+    async def fetch_code(_client, submission_id):
+        nonlocal active
+        await asyncio.sleep(0.01)
+        active -= 1
+        return f"print({submission_id})\n", 1_700_000_000 + submission_id
+
+    settings = main.Settings(
+        config_path=Path("config.ini"),
+        submissions_path=tmp_path,
+        browser_profile_path=Path(".browser-profile"),
+        username="",
+        password="",
+        headless=True,
+        push=False,
+        browser_channel="chrome",
+        login_timeout_seconds=10,
+        request_delay_seconds=0,
+        manual_login=True,
+        concurrent_downloads=3,
+    )
+    mocker.patch.object(
+        main, "fetch_latest_accepted_submission", new=fetch_submission
+    )
+    mocker.patch.object(main, "fetch_submission_code", new=fetch_code)
+
+    files, updated_count, watermark = asyncio.run(
+        main.download_questions(mocker.MagicMock(), settings, questions)
+    )
+
+    assert len(files) == len(questions)
+    assert all(path.is_file() for path in files)
+    assert updated_count == len(questions)
+    assert watermark == 1_700_000_006
+    assert peak == 3
 
 
 def test_password_is_read_from_config(monkeypatch):
@@ -111,6 +165,26 @@ def test_password_is_read_from_config(monkeypatch):
 
     assert settings.username == "configured-user"
     assert settings.password == "configured-password"
+
+
+def test_cli_concurrency_overrides_config():
+    config = main.load_config(Path("does-not-exist.ini"))
+    config.set(main.SECTION_BROWSER, "ConcurrentDownloads", "4")
+    args = SimpleNamespace(
+        config=Path("config.ini"),
+        submissions=Path("submissions"),
+        browser_profile=Path(".browser-profile"),
+        non_interactive=True,
+        headless=None,
+        push=False,
+        browser_channel=None,
+        manual_login=True,
+        concurrency=2,
+    )
+
+    settings = main.resolve_settings(args, config)
+
+    assert settings.concurrent_downloads == 2
 
 
 def test_manual_login_does_not_read_configured_credentials(monkeypatch):
@@ -143,6 +217,26 @@ def test_session_cookie_is_sufficient_even_before_redirect():
         {"name": "LEETCODE_SESSION", "value": "session"},
     ]
     assert main.has_leetcode_session(cookies)
+
+
+def test_only_session_cookie_is_extracted_for_http_requests():
+    cookies = [
+        {"name": "csrftoken", "value": "csrf"},
+        {"name": "cf_clearance", "value": "clearance"},
+        {"name": "LEETCODE_SESSION", "value": "session"},
+    ]
+    assert main.extract_leetcode_session(cookies) == "session"
+
+
+def test_missing_session_cookie_is_rejected():
+    try:
+        main.extract_leetcode_session(
+            [{"name": "csrftoken", "value": "csrf"}]
+        )
+    except main.CrawlerError as exc:
+        assert "session cookie" in str(exc)
+    else:
+        raise AssertionError("missing session cookie was accepted")
 
 
 def test_cloudflare_messages_are_not_treated_as_credential_errors():
@@ -203,6 +297,58 @@ def test_login_waits_for_cloudflare_to_enable_sign_in(mocker):
     assert button.is_enabled.call_count == 3
     button.click.assert_called_once_with(timeout=5_000)
     page.goto.assert_any_call(main.LEETCODE_URL, wait_until="domcontentloaded")
+
+
+def _graphql_response(mocker, status, payload, headers=None):
+    response = mocker.MagicMock()
+    response.status_code = status
+    response.ok = 200 <= status < 400
+    response.headers = headers or {}
+    response.json.return_value = payload
+    return response
+
+
+def test_graphql_request_sends_only_the_session_cookie(mocker):
+    session = mocker.MagicMock()
+    session.post = mocker.AsyncMock(
+        return_value=_graphql_response(
+            mocker, 200, {"data": {"answer": 42}}
+        )
+    )
+    client = main.LeetCodeClient(session, "session-value", 0)
+
+    data = asyncio.run(
+        client.graphql_request("operation", "query", {"id": 1})
+    )
+
+    assert data == {"answer": 42}
+    request = session.post.await_args
+    assert request.kwargs["cookies"] == {
+        main.LEETCODE_SESSION_COOKIE: "session-value"
+    }
+    assert request.kwargs["discard_cookies"]
+
+
+def test_graphql_request_retries_rate_limits(mocker):
+    session = mocker.MagicMock()
+    session.post = mocker.AsyncMock(
+        side_effect=[
+            _graphql_response(
+                mocker, 429, {}, {"retry-after": "0"}
+            ),
+            _graphql_response(mocker, 200, {"data": {"answer": 42}}),
+        ]
+    )
+    client = main.LeetCodeClient(session, "session-value", 0)
+    sleep = mocker.patch.object(
+        main.asyncio, "sleep", new=mocker.AsyncMock()
+    )
+
+    data = asyncio.run(client.graphql_request("operation", "query", {}))
+
+    assert data == {"answer": 42}
+    assert session.post.await_count == 2
+    sleep.assert_awaited_once_with(0.5)
 
 
 def test_numeric_problem_ids_are_zero_padded():
