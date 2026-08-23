@@ -1,12 +1,66 @@
-# Leetcode-Crawler
-Crawl your accepted solutions on LeetCode and push them to a git repository.
+# LeetCode Crawler
+
+Download the newest accepted solution for every solved LeetCode problem, save
+it under `submissions/`, and optionally commit and push the changed files.
+
+## Requirements
+
+- Python 3.10 or newer
+- Git (only needed for automatic commits and pushes)
+- Chrome, or Patchright's Chromium browser
 
 ## Installation
-1. Install [pipenv](https://github.com/pypa/pipenv)
-2. Use `pipenv install` to install all dependencies
-3. Copy [config-sample.ini](config-sample.ini) to `config.ini`
-4. Fill in your LeetCode username and password to `config.ini`
-5. Use `git init submissions` or `git clone [your_remote_repo] submissions` to create the `submissions` folder
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install -r requirements.txt
+python -m patchright install chromium
+```
+
+The last command provides a fallback browser. By default the crawler first uses
+the installed Chrome channel through Patchright and keeps its authenticated
+session in the ignored `.browser-profile/` directory.
+
+## Configuration
+
+Copy `config-sample.ini` to `config.ini`, then put your LeetCode username or
+email in `[User] Username` and your password in `[User] Password`. For
+non-interactive use, `LEETCODE_USERNAME` and `LEETCODE_PASSWORD` environment
+variables can be used instead and take precedence over `config.ini`.
+
+Create or clone the output repository if you want automatic Git commits:
+
+```powershell
+git init submissions
+# or: git clone <your-remote-repository> submissions
+```
 
 ## Usage
-Just execute [main.py](main.py). It will use [Chromium](https://www.chromium.org/) to crawl your accepted solutions since the last updated time set in `config.ini` .
+
+```powershell
+python main.py
+```
+
+LeetCode may show a CAPTCHA or Turnstile challenge. Complete it in the opened
+browser; the crawler waits up to five minutes by default. Patchright removes
+Playwright's browser fingerprints, but does not solve or click the challenge.
+
+Useful options:
+
+```powershell
+# Verify authentication and all three GraphQL queries without writing anything
+python main.py --check --no-push
+
+# Download files without pushing them
+python main.py --no-push
+
+# Enter credentials and complete verification manually in the opened browser
+python main.py --manual-login --no-push
+
+# CI mode (credentials must be in config.ini or environment variables)
+python main.py --headless --non-interactive
+```
+
+The checkpoint advances only after every requested solution is downloaded and
+the configured Git operation succeeds. A failed run is therefore safe to retry.
