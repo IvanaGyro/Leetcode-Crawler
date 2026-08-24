@@ -4,12 +4,13 @@ import argparse
 import asyncio
 import configparser
 import getpass
+import hashlib
 import json
 import os
 import re
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
@@ -53,6 +54,7 @@ GRAPHQL_RETRIES = 5
 LEETCODE_SESSION_COOKIE = "LEETCODE_SESSION"
 DEFAULT_CONCURRENT_DOWNLOADS = 8
 MAX_CONCURRENT_DOWNLOADS = 32
+PROXY_LOGIN_ROUNDS = 2
 
 LOGIN_ERROR_PHRASES = (
     "incorrect username",
@@ -194,6 +196,7 @@ class Settings:
     manual_login: bool
     concurrent_downloads: int = DEFAULT_CONCURRENT_DOWNLOADS
     proxy: ProxySettings | None = None
+    proxy_candidates: tuple[ProxySettings, ...] = ()
 
 
 def load_config(path: Path) -> configparser.ConfigParser:
@@ -293,36 +296,58 @@ def _config_bool(
         raise CrawlerError(f"[{section}] {option} must be true or false") from exc
 
 
-def resolve_proxy_settings() -> ProxySettings | None:
-    server = os.environ.get("LEETCODE_PROXY_SERVER", "").strip()
-    username = os.environ.get("LEETCODE_PROXY_USERNAME", "").strip()
-    password = os.environ.get("LEETCODE_PROXY_PASSWORD", "")
+def resolve_proxy_settings() -> tuple[ProxySettings, ...]:
+    raw_proxy_list = os.environ.get("LEETCODE_PROXY_LIST", "")
+    proxies: list[ProxySettings] = []
 
-    if not server:
-        if username or password:
+    for line_number, raw_line in enumerate(raw_proxy_list.splitlines(), start=1):
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        try:
+            host, port_text, username, password = line.split(":", 3)
+        except ValueError as exc:
             raise CrawlerError(
-                "LEETCODE_PROXY_SERVER is required when proxy credentials are set"
+                "LEETCODE_PROXY_LIST entry "
+                f"{line_number} must use domain:port:username:password"
+            ) from exc
+
+        host = host.strip()
+        port_text = port_text.strip()
+        username = username.strip()
+        if (
+            not host
+            or "://" in host
+            or not port_text.isdigit()
+            or not username
+            or not password
+        ):
+            raise CrawlerError(
+                f"LEETCODE_PROXY_LIST entry {line_number} is invalid"
             )
-        return None
-    if bool(username) != bool(password):
-        raise CrawlerError(
-            "LEETCODE_PROXY_USERNAME and LEETCODE_PROXY_PASSWORD must be set together"
+
+        port = int(port_text)
+        server = f"http://{host}:{port}"
+        try:
+            parsed = urlsplit(server)
+            valid_server = (
+                parsed.scheme == "http"
+                and parsed.hostname is not None
+                and parsed.port == port
+                and 1 <= port <= 65_535
+            )
+        except ValueError:
+            valid_server = False
+        if not valid_server:
+            raise CrawlerError(
+                f"LEETCODE_PROXY_LIST entry {line_number} is invalid"
+            )
+
+        proxies.append(
+            ProxySettings(server=server, username=username, password=password)
         )
 
-    if "://" not in server:
-        server = f"http://{server}"
-    parsed = urlsplit(server)
-    if parsed.scheme not in {"http", "https", "socks5"} or not parsed.hostname:
-        raise CrawlerError(
-            "LEETCODE_PROXY_SERVER must be a valid HTTP, HTTPS, or SOCKS5 proxy URL"
-        )
-    if parsed.username is not None or parsed.password is not None:
-        raise CrawlerError(
-            "LEETCODE_PROXY_SERVER must not contain credentials; use the separate "
-            "proxy username and password variables"
-        )
-
-    return ProxySettings(server=server, username=username, password=password)
+    return tuple(proxies)
 
 
 def resolve_settings(
@@ -422,7 +447,7 @@ def resolve_settings(
         request_delay_seconds=request_delay,
         concurrent_downloads=concurrency,
         manual_login=args.manual_login,
-        proxy=resolve_proxy_settings(),
+        proxy_candidates=resolve_proxy_settings(),
     )
 
 
@@ -813,6 +838,9 @@ def login(page: Any, settings: Settings) -> None:
             "The LeetCode login form did not load after Cloudflare verification."
         ) from exc
 
+    # Each automated-login phase receives its own timeout budget. A slow proxy
+    # that used most of the form-loading budget still gets the full button wait.
+    deadline = time.monotonic() + settings.login_timeout_seconds
     username_field.fill(settings.username)
     password_field.fill(settings.password)
 
@@ -865,6 +893,7 @@ def login(page: Any, settings: Settings) -> None:
         )
 
     print("Signing in. The crawler will resume after verification completes.")
+    deadline = time.monotonic() + settings.login_timeout_seconds
     initial_turnstile_response = _turnstile_response(page)
     submission_count = 1
     last_submission_at = time.monotonic()
@@ -1122,6 +1151,118 @@ def launch_browser_context(playwright: Any, settings: Settings) -> Any:
             ) from second_error
 
 
+def settings_for_proxy(
+    settings: Settings, proxy: ProxySettings | None
+) -> Settings:
+    if proxy is None:
+        return replace(settings, proxy=None)
+
+    profile_key = hashlib.sha256(
+        f"{proxy.server}\0{proxy.username}".encode("utf-8")
+    ).hexdigest()[:16]
+    return replace(
+        settings,
+        proxy=proxy,
+        browser_profile_path=settings.browser_profile_path / f"proxy-{profile_key}",
+    )
+
+
+def safe_login_failure(exc: Exception) -> str:
+    message = str(exc).strip()
+    lowered = message.lower()
+    safe_prefixes = (
+        "the leetcode login form did not load",
+        "leetcode kept the sign in button disabled",
+        "leetcode login timed out",
+        "manual leetcode login timed out",
+    )
+    if lowered.startswith(safe_prefixes):
+        return message
+    if any(
+        token in lowered
+        for token in (
+            "proxy",
+            "tunnel",
+            "net::err",
+            "err_socks",
+            "err_connection",
+            "response_code",
+        )
+    ):
+        return "the proxy or browser connection failed"
+    return "the browser login attempt failed"
+
+
+def authenticate_candidate(playwright: Any, settings: Settings) -> str:
+    from patchright.sync_api import Error as BrowserError
+
+    context = launch_browser_context(playwright, settings)
+    try:
+        page = context.pages[0] if context.pages else context.new_page()
+        page.set_default_timeout(30_000)
+        try:
+            login(page, settings)
+            return extract_leetcode_session(context.cookies([LEETCODE_URL]))
+        except BrowserError as exc:
+            detail = str(exc).strip().lower()
+            if "target page, context or browser has been closed" in detail:
+                message = "The Chrome window was closed before the crawler finished."
+            else:
+                message = "Browser operation failed during LeetCode login."
+            raise CrawlerError(message) from exc
+    finally:
+        try:
+            context.close()
+        except Exception:
+            pass
+
+
+def authenticate_with_proxies(
+    playwright: Any, settings: Settings
+) -> tuple[str, Settings]:
+    candidates: tuple[ProxySettings | None, ...] = (
+        settings.proxy_candidates if settings.proxy_candidates else (None,)
+    )
+    rounds = (
+        PROXY_LOGIN_ROUNDS
+        if settings.proxy_candidates and not settings.manual_login
+        else 1
+    )
+
+    for round_number in range(1, rounds + 1):
+        for candidate_number, proxy in enumerate(candidates, start=1):
+            candidate_settings = settings_for_proxy(settings, proxy)
+            if settings.proxy_candidates:
+                print(
+                    f"Login round {round_number}/{rounds}, "
+                    f"proxy {candidate_number}/{len(candidates)}."
+                )
+            try:
+                session_cookie = authenticate_candidate(
+                    playwright, candidate_settings
+                )
+            except CrawlerError as exc:
+                print(
+                    f"Login round {round_number}/{rounds}, proxy "
+                    f"{candidate_number}/{len(candidates)} failed: "
+                    f"{safe_login_failure(exc)}",
+                    file=sys.stderr,
+                )
+                continue
+
+            if settings.proxy_candidates:
+                print(
+                    f"Authenticated with proxy {candidate_number}/"
+                    f"{len(candidates)} in round {round_number}/{rounds}."
+                )
+            return session_cookie, candidate_settings
+
+    raise CrawlerError(
+        "LeetCode login failed after "
+        f"{rounds} rounds across {len(candidates)} proxy candidates"
+    )
+
+
 def finalize_download(
     config: configparser.ConfigParser,
     settings: Settings,
@@ -1159,31 +1300,13 @@ def execute(args: argparse.Namespace) -> None:
     settings = resolve_settings(args, config)
     checkpoint = get_last_update(config)
 
-    from patchright.sync_api import Error as BrowserError
     from patchright.sync_api import sync_playwright
 
     # Patchright removes Playwright's CDP and command-line fingerprint leaks.
     # The persistent Chrome profile is used only to create or refresh the human
     # session. Bulk requests receive only its LEETCODE_SESSION cookie.
     with sync_playwright() as playwright:
-        context = launch_browser_context(playwright, settings)
-        try:
-            page = context.pages[0] if context.pages else context.new_page()
-            page.set_default_timeout(30_000)
-            try:
-                login(page, settings)
-                session_cookie = extract_leetcode_session(
-                    context.cookies([LEETCODE_URL])
-                )
-            except BrowserError as exc:
-                detail = str(exc).strip() or type(exc).__name__
-                if "target page, context or browser has been closed" in detail.lower():
-                    detail = "The Chrome window was closed before the crawler finished."
-                else:
-                    detail = f"Browser operation failed: {detail}"
-                raise CrawlerError(detail) from exc
-        finally:
-            context.close()
+        session_cookie, settings = authenticate_with_proxies(playwright, settings)
 
     result = asyncio.run(
         run_authenticated(session_cookie, settings, checkpoint, args.check)

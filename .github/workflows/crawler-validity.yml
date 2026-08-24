@@ -5,8 +5,8 @@ on:
     branches: [main]
     types: [opened, reopened, synchronize, ready_for_review]
   schedule:
-    # 03:17 every day in Asia/Taipei (19:17 UTC).
-    - cron: "17 19 * * *"
+    # Every four hours at minute 17, keeping reusable login state fresh.
+    - cron: "17 */4 * * *"
   workflow_dispatch:
 
 permissions:
@@ -46,20 +46,70 @@ jobs:
       - name: Run unit tests
         run: pixi run test
 
+      - name: Restore encrypted login state
+        id: login-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ runner.temp }}/leetcode-login-state.tar.gz.enc
+          key: >-
+            leetcode-login-state-v1-${{ runner.os }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            leetcode-login-state-v1-${{ runner.os }}-
+
+      - name: Decrypt cached login state
+        if: steps.login-cache.outputs.cache-matched-key != ''
+        env:
+          LEETCODE_CACHE_PASSWORD: ${{ secrets.LEETCODE_PASSWORD }}
+        run: |
+          set -euo pipefail
+          encrypted="${RUNNER_TEMP}/leetcode-login-state.tar.gz.enc"
+          archive="${RUNNER_TEMP}/leetcode-login-state.tar.gz"
+          if ! openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 \
+            -in "$encrypted" -out "$archive" \
+            -pass env:LEETCODE_CACHE_PASSWORD 2>/dev/null; then
+            echo "::warning::Cached login state could not be decrypted; logging in again."
+            rm -f "$encrypted" "$archive"
+            exit 0
+          fi
+          tar -xzf "$archive" -C "$RUNNER_TEMP"
+          rm -f "$encrypted" "$archive"
+
       - name: Check 50 live submissions
         env:
           LEETCODE_USERNAME: ${{ secrets.LEETCODE_USERNAME }}
           LEETCODE_PASSWORD: ${{ secrets.LEETCODE_PASSWORD }}
-          LEETCODE_PROXY_SERVER: ${{ secrets.LEETCODE_PROXY_SERVER }}
-          LEETCODE_PROXY_USERNAME: ${{ secrets.LEETCODE_PROXY_USERNAME }}
-          LEETCODE_PROXY_PASSWORD: ${{ secrets.LEETCODE_PROXY_PASSWORD }}
+          LEETCODE_PROXY_LIST: ${{ secrets.LEETCODE_PROXY_LIST }}
         run: >-
           xvfb-run --auto-servernum
           pixi run crawl
           --headed
           --browser-channel ""
           --browser-profile "${{ runner.temp }}/leetcode-browser-profile"
-          --login-timeout-seconds 30
+          --login-timeout-seconds 15
           --non-interactive
           --no-push
           --check 50
+
+      # TODO(PR #11): exclude pull_request runs from both publishing steps
+      # before merge. PR publishing is temporarily enabled for validation.
+      - name: Encrypt refreshed login state
+        if: success()
+        env:
+          LEETCODE_CACHE_PASSWORD: ${{ secrets.LEETCODE_PASSWORD }}
+        run: |
+          set -euo pipefail
+          archive="${RUNNER_TEMP}/leetcode-login-state.tar.gz"
+          encrypted="${RUNNER_TEMP}/leetcode-login-state.tar.gz.enc"
+          tar -czf "$archive" -C "$RUNNER_TEMP" leetcode-browser-profile
+          openssl enc -aes-256-cbc -salt -pbkdf2 -iter 200000 \
+            -in "$archive" -out "$encrypted" \
+            -pass env:LEETCODE_CACHE_PASSWORD
+          rm -f "$archive"
+
+      - name: Save encrypted login state
+        if: success()
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ runner.temp }}/leetcode-login-state.tar.gz.enc
+          key: >-
+            leetcode-login-state-v1-${{ runner.os }}-${{ github.run_id }}-${{ github.run_attempt }}

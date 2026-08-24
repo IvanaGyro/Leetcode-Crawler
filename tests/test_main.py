@@ -252,33 +252,42 @@ def test_cli_login_timeout_overrides_config():
     assert settings.login_timeout_seconds == 30
 
 
-def test_proxy_settings_are_read_from_environment(monkeypatch):
-    monkeypatch.setenv("LEETCODE_PROXY_SERVER", "proxy.example:3128")
-    monkeypatch.setenv("LEETCODE_PROXY_USERNAME", "proxy-user")
-    monkeypatch.setenv("LEETCODE_PROXY_PASSWORD", "proxy-password")
-
-    proxy = main.resolve_proxy_settings()
-
-    assert proxy == main.ProxySettings(
-        server="http://proxy.example:3128",
-        username="proxy-user",
-        password="proxy-password",
-    )
-
-
-def test_proxy_server_rejects_embedded_credentials(monkeypatch):
+def test_proxy_list_is_read_from_one_environment_variable(monkeypatch):
     monkeypatch.setenv(
-        "LEETCODE_PROXY_SERVER", "http://proxy-user:proxy-password@proxy.example:3128"
+        "LEETCODE_PROXY_LIST",
+        "proxy-one.example:3128:user-one:password-one\n"
+        "proxy-two.example:8080:user-two:password:with:colons",
     )
-    monkeypatch.delenv("LEETCODE_PROXY_USERNAME", raising=False)
-    monkeypatch.delenv("LEETCODE_PROXY_PASSWORD", raising=False)
+
+    proxies = main.resolve_proxy_settings()
+
+    assert proxies == (
+        main.ProxySettings(
+            server="http://proxy-one.example:3128",
+            username="user-one",
+            password="password-one",
+        ),
+        main.ProxySettings(
+            server="http://proxy-two.example:8080",
+            username="user-two",
+            password="password:with:colons",
+        ),
+    )
+
+
+def test_proxy_list_rejects_an_invalid_entry_without_echoing_it(monkeypatch):
+    monkeypatch.setenv(
+        "LEETCODE_PROXY_LIST",
+        "proxy-user:proxy-password@proxy.example:3128",
+    )
 
     try:
         main.resolve_proxy_settings()
     except main.CrawlerError as exc:
-        assert "must not contain credentials" in str(exc)
+        assert "entry 1" in str(exc)
+        assert "proxy-password" not in str(exc)
     else:
-        raise AssertionError("embedded proxy credentials were accepted")
+        raise AssertionError("invalid proxy list entry was accepted")
 
 
 def test_manual_login_does_not_read_configured_credentials(monkeypatch):
@@ -359,6 +368,53 @@ def test_browser_and_api_use_the_same_proxy(mocker):
     run_check.assert_awaited_once()
 
 
+def test_proxy_login_retries_the_whole_list_for_two_rounds(mocker):
+    proxies = (
+        main.ProxySettings("http://proxy-one.example:80", "user-one", "password"),
+        main.ProxySettings("http://proxy-two.example:80", "user-two", "password"),
+    )
+    settings = main.Settings(
+        config_path=Path("config.ini"),
+        submissions_path=Path("submissions"),
+        browser_profile_path=Path(".browser-profile"),
+        username="user",
+        password="password",
+        headless=False,
+        push=False,
+        browser_channel=None,
+        login_timeout_seconds=15,
+        request_delay_seconds=0,
+        manual_login=False,
+        proxy_candidates=proxies,
+    )
+    authenticate = mocker.patch.object(
+        main,
+        "authenticate_candidate",
+        side_effect=[
+            main.CrawlerError("form failed"),
+            main.CrawlerError("form failed"),
+            main.CrawlerError("form failed"),
+            "session-cookie",
+        ],
+    )
+
+    session_cookie, selected = main.authenticate_with_proxies(
+        mocker.MagicMock(), settings
+    )
+
+    assert session_cookie == "session-cookie"
+    assert selected.proxy == proxies[1]
+    attempted_settings = [call.args[1] for call in authenticate.call_args_list]
+    assert [attempt.proxy for attempt in attempted_settings] == [
+        proxies[0],
+        proxies[1],
+        proxies[0],
+        proxies[1],
+    ]
+    assert attempted_settings[0].browser_profile_path == attempted_settings[2].browser_profile_path
+    assert attempted_settings[0].browser_profile_path != attempted_settings[1].browser_profile_path
+
+
 def test_session_cookie_is_sufficient_even_before_redirect():
     cookies = [
         {"name": "csrftoken", "value": "csrf"},
@@ -399,8 +455,11 @@ def test_cloudflare_messages_are_not_treated_as_credential_errors():
 def test_login_waits_for_cloudflare_to_enable_sign_in(mocker):
     page = mocker.MagicMock()
     page.url = main.LOGIN_URL
+    clock = [0.0]
+    mocker.patch.object(main.time, "monotonic", side_effect=lambda: clock[0])
 
     username = mocker.MagicMock()
+    username.wait_for.side_effect = lambda **_kwargs: clock.__setitem__(0, 9.0)
     password = mocker.MagicMock()
     button = mocker.MagicMock()
     button.is_visible.return_value = True
@@ -418,6 +477,9 @@ def test_login_waits_for_cloudflare_to_enable_sign_in(mocker):
         "input[name='cf-turnstile-response']": turnstile,
     }
     page.locator.side_effect = locators.__getitem__
+    page.wait_for_timeout.side_effect = lambda milliseconds: clock.__setitem__(
+        0, clock[0] + milliseconds / 1_000
+    )
     page.context.cookies.side_effect = [
         [],
         [],
@@ -444,6 +506,7 @@ def test_login_waits_for_cloudflare_to_enable_sign_in(mocker):
 
     assert button.is_enabled.call_count == 3
     button.click.assert_called_once_with(timeout=5_000)
+    username.wait_for.assert_called_once_with(state="visible", timeout=10_000)
     page.goto.assert_any_call(main.LEETCODE_URL, wait_until="domcontentloaded")
 
 
