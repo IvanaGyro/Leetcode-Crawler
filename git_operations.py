@@ -13,14 +13,15 @@ import sys
 from pathlib import Path
 from typing import Sequence
 
-from errors import CrawlerError
-
-
 BASE_DIR = Path(__file__).resolve().parent
 DEFAULT_SUBMISSIONS_PATH = BASE_DIR / "submissions"
 
 
-class GitUnavailableError(CrawlerError):
+class GitOperationError(RuntimeError):
+    """A user-actionable failure while using the system Git executable."""
+
+
+class GitUnavailableError(GitOperationError):
     """Raised when Git cannot be run from the current environment."""
 
 
@@ -51,7 +52,7 @@ def _run_git(
     *,
     check: bool = True,
 ) -> subprocess.CompletedProcess[str]:
-    """Run Git in a worktree and turn command failures into crawler errors."""
+    """Run Git in a worktree and turn command failures into Git errors."""
     if not _git_is_available():
         raise GitUnavailableError(
             "Git was not found on PATH. Install Git and retry."
@@ -72,7 +73,7 @@ def _run_git(
         ) from exc
 
     if check and result.returncode != 0:
-        raise CrawlerError(f"Git command failed: {_command_detail(result)}")
+        raise GitOperationError(f"Git command failed: {_command_detail(result)}")
     return result
 
 
@@ -128,7 +129,7 @@ def _relative_submission_files(
         try:
             relative_files.add(path.resolve().relative_to(root).as_posix())
         except ValueError as exc:
-            raise CrawlerError(
+            raise GitOperationError(
                 f"Updated submission {path} is outside the Git worktree {root}"
             ) from exc
     return sorted(relative_files)
@@ -149,7 +150,7 @@ def git_commit(repository_path: Path, updated_files: Sequence[Path]) -> bool:
     if diff.returncode == 0:
         return False
     if diff.returncode != 1:
-        raise CrawlerError(
+        raise GitOperationError(
             "Git could not inspect whether the updated submissions are staged"
         )
 

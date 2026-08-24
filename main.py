@@ -17,7 +17,12 @@ from typing import Any, Iterable, Mapping, Sequence
 from curl_cffi.requests.exceptions import RequestException
 
 from errors import CrawlerError
-from git_operations import git_commit, git_push, open_submission_repository
+from git_operations import (
+    GitOperationError,
+    git_commit,
+    git_push,
+    open_submission_repository,
+)
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -1182,7 +1187,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         execute(args)
-    except (CrawlerError, KeyboardInterrupt) as exc:
+    except (CrawlerError, GitOperationError, KeyboardInterrupt) as exc:
         message = "Interrupted" if isinstance(exc, KeyboardInterrupt) else str(exc)
         print(f"Error: {message}", file=sys.stderr)
         return 1

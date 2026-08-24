@@ -483,6 +483,44 @@ def test_missing_git_warns_without_running_a_git_command(tmp_path, capsys, mocke
     assert "checkpoint will not advance" in stderr
 
 
+def test_git_errors_are_not_crawler_errors():
+    error = git_operations.GitOperationError("Git failed")
+    unavailable = git_operations.GitUnavailableError("Git is unavailable")
+
+    assert not isinstance(error, main.CrawlerError)
+    assert isinstance(unavailable, git_operations.GitOperationError)
+    assert not isinstance(unavailable, main.CrawlerError)
+
+
+def test_git_command_failure_uses_git_operation_error(tmp_path, mocker):
+    mocker.patch.object(git_operations, "_git_is_available", return_value=True)
+    mocker.patch.object(
+        git_operations.subprocess,
+        "run",
+        return_value=subprocess.CompletedProcess(
+            ["git", "status"], 1, "", "repository error"
+        ),
+    )
+
+    try:
+        git_operations._run_git(tmp_path, ["status"])
+    except git_operations.GitOperationError as exc:
+        assert "repository error" in str(exc)
+    else:
+        raise AssertionError("Git command failure was not reported as a Git error")
+
+
+def test_main_reports_git_operation_errors(capsys, mocker):
+    mocker.patch.object(
+        main,
+        "execute",
+        side_effect=git_operations.GitOperationError("Git commit failed"),
+    )
+
+    assert main.main([]) == 1
+    assert "Error: Git commit failed" in capsys.readouterr().err
+
+
 def test_non_git_submission_folder_warns_clearly(tmp_path, capsys, mocker):
     mocker.patch.object(git_operations, "_git_is_available", return_value=True)
     mocker.patch.object(
