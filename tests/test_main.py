@@ -232,6 +232,26 @@ def test_cli_concurrency_overrides_config():
     assert settings.concurrent_downloads == 2
 
 
+def test_cli_login_timeout_overrides_config():
+    config = main.load_config(Path("does-not-exist.ini"))
+    config.set(main.SECTION_BROWSER, "LoginTimeoutSeconds", "300")
+    args = SimpleNamespace(
+        config=Path("config.ini"),
+        submissions=Path("submissions"),
+        browser_profile=Path(".browser-profile"),
+        non_interactive=True,
+        headless=None,
+        push=False,
+        browser_channel=None,
+        manual_login=True,
+        login_timeout_seconds=30,
+    )
+
+    settings = main.resolve_settings(args, config)
+
+    assert settings.login_timeout_seconds == 30
+
+
 def test_proxy_settings_are_read_from_environment(monkeypatch):
     monkeypatch.setenv("LEETCODE_PROXY_SERVER", "proxy.example:3128")
     monkeypatch.setenv("LEETCODE_PROXY_USERNAME", "proxy-user")

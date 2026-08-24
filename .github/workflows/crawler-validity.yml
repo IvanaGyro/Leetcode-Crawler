@@ -59,6 +59,7 @@ jobs:
           --headed
           --browser-channel ""
           --browser-profile "${{ runner.temp }}/leetcode-browser-profile"
+          --login-timeout-seconds 30
           --non-interactive
           --no-push
           --check 50

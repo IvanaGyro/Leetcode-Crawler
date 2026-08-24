@@ -373,7 +373,7 @@ def resolve_settings(
     channel = channel or None
 
     try:
-        login_timeout = config.getint(
+        configured_login_timeout = config.getint(
             SECTION_BROWSER, "LoginTimeoutSeconds", fallback=300
         )
         request_delay = config.getfloat(
@@ -389,6 +389,12 @@ def resolve_settings(
             "Browser timeout, request delay, and concurrency settings must be numeric"
         ) from exc
     concurrency_argument = getattr(args, "concurrency", None)
+    login_timeout_argument = getattr(args, "login_timeout_seconds", None)
+    login_timeout = (
+        configured_login_timeout
+        if login_timeout_argument is None
+        else login_timeout_argument
+    )
     concurrency = (
         configured_concurrency
         if concurrency_argument is None
@@ -773,11 +779,16 @@ def login(page: Any, settings: Settings) -> None:
         return
 
     page.goto(LOGIN_URL, wait_until="domcontentloaded")
+    deadline = time.monotonic() + settings.login_timeout_seconds
+
+    def remaining_timeout_ms(cap: int | None = None) -> int:
+        remaining = max(1, int((deadline - time.monotonic()) * 1_000))
+        return remaining if cap is None else min(remaining, cap)
+
     if settings.manual_login:
         print(
             "Sign in manually in the browser and complete Cloudflare verification."
         )
-        deadline = time.monotonic() + settings.login_timeout_seconds
         while time.monotonic() < deadline:
             cookies = page.context.cookies([LEETCODE_URL])
             if has_leetcode_session(cookies):
@@ -795,14 +806,13 @@ def login(page: Any, settings: Settings) -> None:
     print("Waiting for LeetCode. Complete any Cloudflare verification shown.")
     try:
         username_field.wait_for(
-            state="visible", timeout=settings.login_timeout_seconds * 1_000
+            state="visible", timeout=remaining_timeout_ms()
         )
     except Exception as exc:
         raise CrawlerError(
             "The LeetCode login form did not load after Cloudflare verification."
         ) from exc
 
-    deadline = time.monotonic() + settings.login_timeout_seconds
     username_field.fill(settings.username)
     password_field.fill(settings.password)
 
@@ -826,13 +836,13 @@ def login(page: Any, settings: Settings) -> None:
         try:
             button_is_ready = (
                 sign_in_button.is_visible()
-                and sign_in_button.is_enabled(timeout=1_000)
+                and sign_in_button.is_enabled(timeout=remaining_timeout_ms(1_000))
             )
         except Exception:
             button_is_ready = False
         if button_is_ready:
             try:
-                sign_in_button.click(timeout=5_000)
+                sign_in_button.click(timeout=remaining_timeout_ms(5_000))
                 initial_click_completed = True
                 break
             except Exception:
@@ -855,7 +865,6 @@ def login(page: Any, settings: Settings) -> None:
         )
 
     print("Signing in. The crawler will resume after verification completes.")
-    deadline = time.monotonic() + settings.login_timeout_seconds
     initial_turnstile_response = _turnstile_response(page)
     submission_count = 1
     last_submission_at = time.monotonic()
@@ -912,7 +921,7 @@ def login(page: Any, settings: Settings) -> None:
             if sign_in_button.is_enabled():
                 print("Cloudflare verification completed; resubmitting sign-in once.")
                 try:
-                    sign_in_button.click(timeout=5_000)
+                    sign_in_button.click(timeout=remaining_timeout_ms(5_000))
                 except Exception:
                     pass
                 else:
@@ -1238,6 +1247,12 @@ def build_parser() -> argparse.ArgumentParser:
             "maximum concurrent solution downloads "
             f"(1-{MAX_CONCURRENT_DOWNLOADS})"
         ),
+    )
+    parser.add_argument(
+        "--login-timeout-seconds",
+        type=int,
+        default=None,
+        help="override the maximum time to wait for LeetCode login (minimum: 10)",
     )
     parser.add_argument(
         "--non-interactive",

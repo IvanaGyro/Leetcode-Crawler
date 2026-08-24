@@ -74,6 +74,9 @@ pixi run crawl --manual-login --no-push
 # Override the default eight concurrent solution downloads
 pixi run crawl --concurrency 4 --no-push
 
+# Limit login and Cloudflare waiting to 30 seconds
+pixi run crawl --login-timeout-seconds 30 --no-push
+
 # CI mode (credentials must be in config.ini or environment variables)
 pixi run crawl --headless --non-interactive
 ```
