@@ -48,7 +48,7 @@ jobs:
 
       - name: Restore encrypted login state
         id: login-cache
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v6
         with:
           path: ${{ runner.temp }}/leetcode-login-state.tar.gz.enc
           key: >-
@@ -117,7 +117,7 @@ jobs:
 
       - name: Save encrypted login state
         if: always() && steps.prepare-login-cache.outputs.ready == 'true'
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v6
         with:
           path: ${{ runner.temp }}/leetcode-login-state.tar.gz.enc
           key: >-
