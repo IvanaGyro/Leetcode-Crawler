@@ -51,8 +51,9 @@ jobs:
           LEETCODE_USERNAME: ${{ secrets.LEETCODE_USERNAME }}
           LEETCODE_PASSWORD: ${{ secrets.LEETCODE_PASSWORD }}
         run: >-
+          xvfb-run --auto-servernum
           pixi run crawl
-          --headless
+          --headed
           --browser-channel ""
           --browser-profile "${{ runner.temp }}/leetcode-browser-profile"
           --non-interactive
