@@ -232,6 +232,35 @@ def test_cli_concurrency_overrides_config():
     assert settings.concurrent_downloads == 2
 
 
+def test_proxy_settings_are_read_from_environment(monkeypatch):
+    monkeypatch.setenv("LEETCODE_PROXY_SERVER", "proxy.example:3128")
+    monkeypatch.setenv("LEETCODE_PROXY_USERNAME", "proxy-user")
+    monkeypatch.setenv("LEETCODE_PROXY_PASSWORD", "proxy-password")
+
+    proxy = main.resolve_proxy_settings()
+
+    assert proxy == main.ProxySettings(
+        server="http://proxy.example:3128",
+        username="proxy-user",
+        password="proxy-password",
+    )
+
+
+def test_proxy_server_rejects_embedded_credentials(monkeypatch):
+    monkeypatch.setenv(
+        "LEETCODE_PROXY_SERVER", "http://proxy-user:proxy-password@proxy.example:3128"
+    )
+    monkeypatch.delenv("LEETCODE_PROXY_USERNAME", raising=False)
+    monkeypatch.delenv("LEETCODE_PROXY_PASSWORD", raising=False)
+
+    try:
+        main.resolve_proxy_settings()
+    except main.CrawlerError as exc:
+        assert "must not contain credentials" in str(exc)
+    else:
+        raise AssertionError("embedded proxy credentials were accepted")
+
+
 def test_manual_login_does_not_read_configured_credentials(monkeypatch):
     config = main.load_config(Path("does-not-exist.ini"))
     config.set(main.SECTION_USER, main.USER_USERNAME, "configured-user")
@@ -254,6 +283,60 @@ def test_manual_login_does_not_read_configured_credentials(monkeypatch):
     assert settings.username == ""
     assert settings.password == ""
     assert settings.manual_login
+
+
+def test_browser_and_api_use_the_same_proxy(mocker):
+    proxy = main.ProxySettings(
+        server="http://proxy.example:3128",
+        username="proxy-user",
+        password="proxy-password",
+    )
+    settings = main.Settings(
+        config_path=Path("config.ini"),
+        submissions_path=Path("submissions"),
+        browser_profile_path=Path(".browser-profile"),
+        username="user",
+        password="password",
+        headless=False,
+        push=False,
+        browser_channel="chrome",
+        login_timeout_seconds=10,
+        request_delay_seconds=0,
+        manual_login=False,
+        proxy=proxy,
+    )
+    playwright = mocker.MagicMock()
+    browser_context = mocker.MagicMock()
+    playwright.chromium.launch_persistent_context.return_value = browser_context
+
+    assert main.launch_browser_context(playwright, settings) is browser_context
+    browser_options = playwright.chromium.launch_persistent_context.call_args.kwargs
+    assert browser_options["proxy"] == {
+        "server": proxy.server,
+        "username": proxy.username,
+        "password": proxy.password,
+    }
+
+    session = mocker.MagicMock()
+    session_context = mocker.MagicMock()
+    session_context.__aenter__ = mocker.AsyncMock(return_value=session)
+    session_context.__aexit__ = mocker.AsyncMock(return_value=None)
+    async_session = mocker.patch(
+        "curl_cffi.requests.AsyncSession", return_value=session_context
+    )
+    run_check = mocker.patch.object(
+        main, "run_check", new=mocker.AsyncMock(return_value=None)
+    )
+
+    result = asyncio.run(
+        main.run_authenticated("session-cookie", settings, checkpoint=0, check_limit=1)
+    )
+
+    assert result is None
+    api_options = async_session.call_args.kwargs
+    assert api_options["proxy"] == proxy.server
+    assert api_options["proxy_auth"] == (proxy.username, proxy.password)
+    run_check.assert_awaited_once()
 
 
 def test_session_cookie_is_sufficient_even_before_redirect():

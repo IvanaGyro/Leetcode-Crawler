@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
+from urllib.parse import urlsplit
 
 from curl_cffi.requests.exceptions import RequestException
 
@@ -172,6 +173,13 @@ class Submission:
 
 
 @dataclass(frozen=True)
+class ProxySettings:
+    server: str
+    username: str = ""
+    password: str = ""
+
+
+@dataclass(frozen=True)
 class Settings:
     config_path: Path
     submissions_path: Path
@@ -185,6 +193,7 @@ class Settings:
     request_delay_seconds: float
     manual_login: bool
     concurrent_downloads: int = DEFAULT_CONCURRENT_DOWNLOADS
+    proxy: ProxySettings | None = None
 
 
 def load_config(path: Path) -> configparser.ConfigParser:
@@ -284,6 +293,38 @@ def _config_bool(
         raise CrawlerError(f"[{section}] {option} must be true or false") from exc
 
 
+def resolve_proxy_settings() -> ProxySettings | None:
+    server = os.environ.get("LEETCODE_PROXY_SERVER", "").strip()
+    username = os.environ.get("LEETCODE_PROXY_USERNAME", "").strip()
+    password = os.environ.get("LEETCODE_PROXY_PASSWORD", "")
+
+    if not server:
+        if username or password:
+            raise CrawlerError(
+                "LEETCODE_PROXY_SERVER is required when proxy credentials are set"
+            )
+        return None
+    if bool(username) != bool(password):
+        raise CrawlerError(
+            "LEETCODE_PROXY_USERNAME and LEETCODE_PROXY_PASSWORD must be set together"
+        )
+
+    if "://" not in server:
+        server = f"http://{server}"
+    parsed = urlsplit(server)
+    if parsed.scheme not in {"http", "https", "socks5"} or not parsed.hostname:
+        raise CrawlerError(
+            "LEETCODE_PROXY_SERVER must be a valid HTTP, HTTPS, or SOCKS5 proxy URL"
+        )
+    if parsed.username is not None or parsed.password is not None:
+        raise CrawlerError(
+            "LEETCODE_PROXY_SERVER must not contain credentials; use the separate "
+            "proxy username and password variables"
+        )
+
+    return ProxySettings(server=server, username=username, password=password)
+
+
 def resolve_settings(
     args: argparse.Namespace, config: configparser.ConfigParser
 ) -> Settings:
@@ -375,6 +416,7 @@ def resolve_settings(
         request_delay_seconds=request_delay,
         concurrent_downloads=concurrency,
         manual_login=args.manual_login,
+        proxy=resolve_proxy_settings(),
     )
 
 
@@ -1012,11 +1054,16 @@ async def run_authenticated(
         "Origin": LEETCODE_URL,
         "Referer": f"{LEETCODE_URL}/",
     }
+    proxy = settings.proxy
     async with AsyncSession(
         headers=headers,
         impersonate="chrome",
         max_clients=settings.concurrent_downloads,
         timeout=30,
+        proxy=proxy.server if proxy else None,
+        proxy_auth=(proxy.username, proxy.password)
+        if proxy and proxy.username
+        else None,
     ) as session:
         client = LeetCodeClient(
             session,
@@ -1038,6 +1085,14 @@ def launch_browser_context(playwright: Any, settings: Settings) -> Any:
     }
     if settings.browser_channel:
         options["channel"] = settings.browser_channel
+    if settings.proxy:
+        proxy: dict[str, str] = {"server": settings.proxy.server}
+        if settings.proxy.username:
+            proxy.update(
+                username=settings.proxy.username,
+                password=settings.proxy.password,
+            )
+        options["proxy"] = proxy
     try:
         return playwright.chromium.launch_persistent_context(**options)
     except Exception as first_error:

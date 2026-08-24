@@ -50,6 +50,9 @@ jobs:
         env:
           LEETCODE_USERNAME: ${{ secrets.LEETCODE_USERNAME }}
           LEETCODE_PASSWORD: ${{ secrets.LEETCODE_PASSWORD }}
+          LEETCODE_PROXY_SERVER: ${{ secrets.LEETCODE_PROXY_SERVER }}
+          LEETCODE_PROXY_USERNAME: ${{ secrets.LEETCODE_PROXY_USERNAME }}
+          LEETCODE_PROXY_PASSWORD: ${{ secrets.LEETCODE_PROXY_PASSWORD }}
         run: >-
           xvfb-run --auto-servernum
           pixi run crawl

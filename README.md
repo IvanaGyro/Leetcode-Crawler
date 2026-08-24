@@ -17,6 +17,12 @@ email in `[User] Username` and your password in `[User] Password`. For
 non-interactive use, `LEETCODE_USERNAME` and `LEETCODE_PASSWORD` environment
 variables can be used instead and take precedence over `config.ini`.
 
+For a trusted proxy, set `LEETCODE_PROXY_SERVER` to an HTTP, HTTPS, or SOCKS5
+proxy URL. If the proxy requires authentication, also set
+`LEETCODE_PROXY_USERNAME` and `LEETCODE_PROXY_PASSWORD`; keep credentials out of
+the server URL. Browser login and solution API requests use the same proxy so
+the authenticated session keeps one egress IP.
+
 For automatic Git commits, initialize or clone a repository that contains
 `submissions/`. The folder may be the repository itself or a subfolder of it.
 
