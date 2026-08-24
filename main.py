@@ -952,23 +952,49 @@ async def crawl(
     return submission_files, updated_count, max(watermark, download_watermark)
 
 
-async def run_check(client: LeetCodeClient) -> None:
+async def run_check(
+    client: LeetCodeClient, limit: int, concurrent_downloads: int
+) -> None:
     solved_questions = await fetch_solved_questions(client)
     if not solved_questions:
         print("Authenticated API check succeeded; this account has no solved problems.")
         return
-    latest_question = max(
-        solved_questions, key=lambda question: question.last_submitted_at or 0
-    )
-    submission = await fetch_latest_accepted_submission(
-        client, latest_question.title_slug
-    )
-    code, _ = await fetch_submission_code(client, submission.submission_id)
-    if not code:
-        raise CrawlerError("LeetCode returned an empty solution during the API check")
+
+    check_questions = sorted(
+        solved_questions,
+        key=lambda question: question.last_submitted_at or 0,
+        reverse=True,
+    )[:limit]
+    semaphore = asyncio.Semaphore(concurrent_downloads)
+    progress_lock = asyncio.Lock()
+    completed_count = 0
+
+    async def validate(question: SolvedQuestion) -> None:
+        nonlocal completed_count
+        async with semaphore:
+            submission = await fetch_latest_accepted_submission(
+                client, question.title_slug
+            )
+            code, _ = await fetch_submission_code(client, submission.submission_id)
+            if not code:
+                raise CrawlerError(
+                    f"LeetCode returned an empty solution for {question.title_slug!r} "
+                    "during the API check"
+                )
+
+        async with progress_lock:
+            completed_count += 1
+            print(
+                f"[{completed_count}/{len(check_questions)}] Verified "
+                f"{question.frontend_id}. {question.title}"
+            )
+
+    await asyncio.gather(*(validate(question) for question in check_questions))
+    noun = "submission" if len(check_questions) == 1 else "submissions"
     print(
         "Authenticated API check succeeded: "
-        f"{len(solved_questions)} solved problems found and solution download verified."
+        f"{len(solved_questions)} solved problems found and "
+        f"{len(check_questions)} {noun} downloaded."
     )
 
 
@@ -976,7 +1002,7 @@ async def run_authenticated(
     session_cookie: str,
     settings: Settings,
     checkpoint: int,
-    check_only: bool,
+    check_limit: int | None,
 ) -> tuple[list[Path], int, int] | None:
     from curl_cffi.requests import AsyncSession
 
@@ -997,8 +1023,8 @@ async def run_authenticated(
             session_cookie,
             settings.request_delay_seconds,
         )
-        if check_only:
-            await run_check(client)
+        if check_limit is not None:
+            await run_check(client, check_limit, settings.concurrent_downloads)
             return None
         return await crawl(client, settings, checkpoint)
 
@@ -1173,10 +1199,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--check",
-        action="store_true",
+        nargs="?",
+        type=int,
+        const=1,
+        metavar="COUNT",
         help=(
-            "verify login and API access without writing files, Git commits, "
-            "or checkpoints"
+            "verify login and API access for up to COUNT latest accepted "
+            "submissions without writing files, Git commits, or checkpoints "
+            "(default: 1)"
         ),
     )
     return parser
@@ -1185,6 +1215,8 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    if args.check is not None and args.check < 1:
+        parser.error("--check COUNT must be at least 1")
     try:
         execute(args)
     except (CrawlerError, GitOperationError, KeyboardInterrupt) as exc:

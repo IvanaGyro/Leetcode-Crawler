@@ -53,6 +53,9 @@ Useful options:
 # Verify authentication and all three GraphQL queries without writing anything
 pixi run crawl --check --no-push
 
+# Validate up to 50 of the most recent accepted submissions (useful for CI)
+pixi run crawl --check 50 --no-push
+
 # Download and commit files locally, without pushing them
 pixi run crawl --no-push
 
@@ -87,3 +90,10 @@ worker.
 ```powershell
 pixi run test
 ```
+
+The `Crawler validity` GitHub Actions workflow also runs daily and for pull
+requests targeting `main`. Pull requests are tested from GitHub's merge ref, so
+the checked revision includes the current target-branch commit. The live check
+downloads up to 50 recent submissions without writing solutions, committing, or
+pushing. Configure `LEETCODE_USERNAME` and `LEETCODE_PASSWORD` as repository
+Actions secrets for this job.

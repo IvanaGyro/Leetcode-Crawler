@@ -146,6 +146,49 @@ def test_downloads_use_bounded_concurrency(tmp_path, mocker):
     assert peak == 3
 
 
+def test_check_downloads_a_bounded_recent_sample(mocker, capsys):
+    questions = [
+        main.SolvedQuestion(str(index), f"Question {index}", str(index), index)
+        for index in range(1, 76)
+    ]
+    checked_slugs = []
+
+    async def fetch_submission(_client, title_slug):
+        checked_slugs.append(title_slug)
+        return main.Submission(int(title_slug), "python3", int(title_slug))
+
+    async def fetch_code(_client, submission_id):
+        return f"print({submission_id})\n", submission_id
+
+    mocker.patch.object(
+        main,
+        "fetch_solved_questions",
+        new=mocker.AsyncMock(return_value=questions),
+    )
+    mocker.patch.object(
+        main, "fetch_latest_accepted_submission", new=fetch_submission
+    )
+    mocker.patch.object(main, "fetch_submission_code", new=fetch_code)
+
+    asyncio.run(
+        main.run_check(mocker.MagicMock(), limit=50, concurrent_downloads=4)
+    )
+
+    assert set(checked_slugs) == {str(index) for index in range(26, 76)}
+    assert len(checked_slugs) == 50
+    assert (
+        "75 solved problems found and 50 submissions downloaded"
+        in capsys.readouterr().out
+    )
+
+
+def test_check_cli_defaults_to_one_submission_and_accepts_a_limit():
+    parser = main.build_parser()
+
+    assert parser.parse_args(["--check"]).check == 1
+    assert parser.parse_args(["--check", "50"]).check == 50
+
+
 def test_password_is_read_from_config(monkeypatch):
     config = main.load_config(Path("does-not-exist.ini"))
     config.set(main.SECTION_USER, main.USER_USERNAME, "configured-user")

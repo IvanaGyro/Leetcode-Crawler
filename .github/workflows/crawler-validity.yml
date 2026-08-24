@@ -1,0 +1,60 @@
+name: Crawler validity
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, reopened, synchronize, ready_for_review]
+  schedule:
+    # 03:17 every day in Asia/Taipei (19:17 UTC).
+    - cron: "17 19 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: crawler-validity-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  live-check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      # For pull_request events, this is GitHub's synthetic merge of the PR
+      # head into its current base, rather than the PR head alone.
+      - name: Check out the tested revision
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify the PR includes its main base
+        if: github.event_name == 'pull_request'
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: git merge-base --is-ancestor "$BASE_SHA" HEAD
+
+      - name: Set up Pixi
+        uses: prefix-dev/setup-pixi@v0.10.0
+        with:
+          frozen: true
+          cache: true
+          cache-write: ${{ github.event_name == 'schedule' }}
+
+      - name: Run unit tests
+        run: pixi run test
+
+      - name: Check 50 live submissions
+        env:
+          LEETCODE_USERNAME: ${{ secrets.LEETCODE_USERNAME }}
+          LEETCODE_PASSWORD: ${{ secrets.LEETCODE_PASSWORD }}
+        run: >-
+          pixi run crawl
+          --headless
+          --browser-channel ""
+          --browser-profile "${{ runner.temp }}/leetcode-browser-profile"
+          --non-interactive
+          --no-push
+          --check 50
