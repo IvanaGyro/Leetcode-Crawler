@@ -75,6 +75,7 @@ jobs:
           rm -f "$encrypted" "$archive"
 
       - name: Check 50 live submissions
+        id: live-check
         env:
           LEETCODE_USERNAME: ${{ secrets.LEETCODE_USERNAME }}
           LEETCODE_PASSWORD: ${{ secrets.LEETCODE_PASSWORD }}
@@ -93,21 +94,29 @@ jobs:
       # TODO(PR #11): exclude pull_request runs from both publishing steps
       # before merge. PR publishing is temporarily enabled for validation.
       - name: Encrypt refreshed login state
-        if: success()
+        id: prepare-login-cache
+        if: always() && steps.live-check.outcome != 'skipped'
         env:
           LEETCODE_CACHE_PASSWORD: ${{ secrets.LEETCODE_PASSWORD }}
         run: |
           set -euo pipefail
+          profile="${RUNNER_TEMP}/leetcode-browser-profile"
           archive="${RUNNER_TEMP}/leetcode-login-state.tar.gz"
           encrypted="${RUNNER_TEMP}/leetcode-login-state.tar.gz.enc"
+          if [[ ! -d "$profile" ]]; then
+            echo "::warning::No browser profile was created; skipping login-state cache."
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           tar -czf "$archive" -C "$RUNNER_TEMP" leetcode-browser-profile
           openssl enc -aes-256-cbc -salt -pbkdf2 -iter 200000 \
             -in "$archive" -out "$encrypted" \
             -pass env:LEETCODE_CACHE_PASSWORD
           rm -f "$archive"
+          echo "ready=true" >> "$GITHUB_OUTPUT"
 
       - name: Save encrypted login state
-        if: success()
+        if: always() && steps.prepare-login-cache.outputs.ready == 'true'
         uses: actions/cache/save@v4
         with:
           path: ${{ runner.temp }}/leetcode-login-state.tar.gz.enc

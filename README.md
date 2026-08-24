@@ -115,7 +115,8 @@ check downloads up to 50 recent submissions without writing solutions,
 committing, or pushing. Configure `LEETCODE_USERNAME`, `LEETCODE_PASSWORD`, and
 the multiline `LEETCODE_PROXY_LIST` as repository Actions secrets for this job.
 
-Successful runs cache the per-proxy browser profiles so later checks can reuse
-the authenticated session. The profile archive is encrypted with
-`LEETCODE_PASSWORD` before it is saved to GitHub Actions cache; plaintext login
-state is never placed in Git or in the cache.
+Runs that create per-proxy browser profiles cache them so later checks can reuse
+the authenticated session or continue the browser verification state. The
+profile archive is encrypted with `LEETCODE_PASSWORD` before it is saved to
+GitHub Actions cache; plaintext login state is never placed in Git or in the
+cache.
