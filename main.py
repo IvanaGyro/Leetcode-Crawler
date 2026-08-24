@@ -1027,6 +1027,38 @@ def launch_browser_context(playwright: Any, settings: Settings) -> Any:
             ) from second_error
 
 
+def finalize_download(
+    config: configparser.ConfigParser,
+    settings: Settings,
+    checkpoint: int,
+    submission_files: Sequence[Path],
+    watermark: int,
+) -> bool:
+    """Commit, optionally push, and advance the checkpoint when it is safe."""
+    repository_path = open_submission_repository(
+        settings.submissions_path, push_requested=settings.push
+    )
+    if repository_path is None:
+        committed = False
+        push_succeeded = not settings.push
+    else:
+        committed = git_commit(repository_path, submission_files)
+        push_succeeded = not settings.push or git_push(
+            repository_path, settings.submissions_path
+        )
+
+    if watermark > checkpoint:
+        if push_succeeded:
+            save_checkpoint(config, settings.config_path, watermark)
+        else:
+            print(
+                "The checkpoint was not advanced because the requested Git push "
+                "did not succeed.",
+                file=sys.stderr,
+            )
+    return committed
+
+
 def execute(args: argparse.Namespace) -> None:
     config = load_config(args.config.resolve())
     settings = resolve_settings(args, config)
@@ -1065,26 +1097,9 @@ def execute(args: argparse.Namespace) -> None:
         return
 
     submission_files, updated_count, watermark = result
-    repository = open_submission_repository(
-        settings.submissions_path, push_requested=settings.push
+    committed = finalize_download(
+        config, settings, checkpoint, submission_files, watermark
     )
-    if repository is None:
-        committed = False
-        push_succeeded = not settings.push
-    else:
-        committed = git_commit(repository, submission_files)
-        push_succeeded = not settings.push or git_push(
-            repository, settings.submissions_path
-        )
-
-    if watermark > checkpoint:
-        if push_succeeded:
-            save_checkpoint(config, settings.config_path, watermark)
-        else:
-            print(
-                "Git push was skipped, so the checkpoint was not advanced.",
-                file=sys.stderr,
-            )
 
     noun = "submission" if updated_count == 1 else "submissions"
     print(f"{updated_count} {noun} updated.")

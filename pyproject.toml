@@ -22,26 +22,10 @@ platforms = [
     "win-arm64",
 ]
 
-[tool.pixi.target.linux-64.dependencies]
-pygit2 = "==1.20.0"
-
-[tool.pixi.target.linux-aarch64.dependencies]
-pygit2 = "==1.20.0"
-
-[tool.pixi.target.osx-64.dependencies]
-pygit2 = "==1.20.0"
-
-[tool.pixi.target.osx-arm64.dependencies]
-pygit2 = "==1.20.0"
-
-[tool.pixi.target.win-64.dependencies]
-pygit2 = "==1.20.0"
-
-[tool.pixi.target.win-arm64.pypi-dependencies]
-pygit2 = "==1.20.0"
-
 [tool.pixi.tasks]
+crawl = { cmd = "python main.py", depends-on = ["install-browser"] }
 crawler = { cmd = "python main.py", depends-on = ["install-browser"] }
+push = "python git_operations.py"
 install-browser = "patchright install chromium"
 test = "python -m pytest"
 
