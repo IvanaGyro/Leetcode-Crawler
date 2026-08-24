@@ -110,10 +110,11 @@ pixi run test
 
 The `Crawler validity` GitHub Actions workflow runs every four hours and for
 pull requests targeting `main`. Pull requests are tested from GitHub's merge
-ref, so the checked revision includes the current target-branch commit. The live
-check downloads up to 50 recent submissions without writing solutions,
-committing, or pushing. Configure `LEETCODE_USERNAME`, `LEETCODE_PASSWORD`, and
-the multiline `LEETCODE_PROXY_LIST` as repository Actions secrets for this job.
+ref, so the checked revision includes the current target-branch commit. A pinned
+Windows Server 2025 runner launches headed Chromium without Xvfb. The live check
+downloads up to 50 recent submissions without writing solutions, committing, or
+pushing. Configure `LEETCODE_USERNAME`, `LEETCODE_PASSWORD`, and the multiline
+`LEETCODE_PROXY_LIST` as repository Actions secrets for this job.
 
 Runs that create per-proxy browser profiles cache them so later checks can reuse
 the authenticated session or continue the browser verification state. The

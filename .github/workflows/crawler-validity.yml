@@ -18,7 +18,7 @@ concurrency:
 
 jobs:
   live-check:
-    runs-on: ubuntu-latest
+    runs-on: windows-2025
     timeout-minutes: 30
 
     steps:
@@ -34,7 +34,7 @@ jobs:
         if: github.event_name == 'pull_request'
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
-        run: git merge-base --is-ancestor "$BASE_SHA" HEAD
+        run: git merge-base --is-ancestor "$env:BASE_SHA" HEAD
 
       - name: Set up Pixi
         uses: prefix-dev/setup-pixi@v0.10.0
@@ -61,18 +61,23 @@ jobs:
         env:
           LEETCODE_CACHE_PASSWORD: ${{ secrets.LEETCODE_PASSWORD }}
         run: |
-          set -euo pipefail
-          encrypted="${RUNNER_TEMP}/leetcode-login-state.tar.gz.enc"
-          archive="${RUNNER_TEMP}/leetcode-login-state.tar.gz"
-          if ! openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 \
-            -in "$encrypted" -out "$archive" \
-            -pass env:LEETCODE_CACHE_PASSWORD 2>/dev/null; then
-            echo "::warning::Cached login state could not be decrypted; logging in again."
-            rm -f "$encrypted" "$archive"
+          $ErrorActionPreference = "Stop"
+          $encrypted = Join-Path $env:RUNNER_TEMP "leetcode-login-state.tar.gz.enc"
+          $archive = Join-Path $env:RUNNER_TEMP "leetcode-login-state.tar.gz"
+          & openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 `
+            -in $encrypted -out $archive `
+            -pass env:LEETCODE_CACHE_PASSWORD 2>$null
+          if ($LASTEXITCODE -ne 0) {
+            Write-Output "::warning::Cached login state could not be decrypted; logging in again."
+            Remove-Item -LiteralPath $encrypted, $archive `
+              -Force -ErrorAction SilentlyContinue
             exit 0
-          fi
-          tar -xzf "$archive" -C "$RUNNER_TEMP"
-          rm -f "$encrypted" "$archive"
+          }
+          & tar -xzf $archive -C $env:RUNNER_TEMP
+          if ($LASTEXITCODE -ne 0) {
+            throw "Cached login state could not be extracted."
+          }
+          Remove-Item -LiteralPath $encrypted, $archive -Force
 
       - name: Check 50 live submissions
         id: live-check
@@ -81,10 +86,9 @@ jobs:
           LEETCODE_PASSWORD: ${{ secrets.LEETCODE_PASSWORD }}
           LEETCODE_PROXY_LIST: ${{ secrets.LEETCODE_PROXY_LIST }}
         run: >-
-          xvfb-run --auto-servernum
           pixi run crawl
           --headed
-          --browser-channel ""
+          --browser-channel=
           --browser-profile "${{ runner.temp }}/leetcode-browser-profile"
           --login-timeout-seconds 20
           --non-interactive
@@ -99,21 +103,37 @@ jobs:
         env:
           LEETCODE_CACHE_PASSWORD: ${{ secrets.LEETCODE_PASSWORD }}
         run: |
-          set -euo pipefail
-          profile="${RUNNER_TEMP}/leetcode-browser-profile"
-          archive="${RUNNER_TEMP}/leetcode-login-state.tar.gz"
-          encrypted="${RUNNER_TEMP}/leetcode-login-state.tar.gz.enc"
-          if [[ ! -d "$profile" ]]; then
-            echo "::warning::No browser profile was created; skipping login-state cache."
-            echo "ready=false" >> "$GITHUB_OUTPUT"
+          $ErrorActionPreference = "Stop"
+          $profile = Join-Path $env:RUNNER_TEMP "leetcode-browser-profile"
+          $archive = Join-Path $env:RUNNER_TEMP "leetcode-login-state.tar.gz"
+          $encrypted = Join-Path $env:RUNNER_TEMP "leetcode-login-state.tar.gz.enc"
+          if (-not (Test-Path -LiteralPath $profile -PathType Container)) {
+            Write-Output "::warning::No browser profile was created; skipping login-state cache."
+            "ready=false" | Out-File -FilePath $env:GITHUB_OUTPUT `
+              -Encoding utf8 -Append
             exit 0
-          fi
-          tar -czf "$archive" -C "$RUNNER_TEMP" leetcode-browser-profile
-          openssl enc -aes-256-cbc -salt -pbkdf2 -iter 200000 \
-            -in "$archive" -out "$encrypted" \
+          }
+          # Chromium may briefly retain Windows file locks on volatile GPU
+          # caches. They are not login state and do not need to be restored.
+          & tar -czf $archive `
+            --exclude="*/ShaderCache/*" `
+            --exclude="*/GrShaderCache/*" `
+            --exclude="*/GPUCache/*" `
+            --exclude="*/DawnGraphiteCache/*" `
+            --exclude="*/DawnWebGPUCache/*" `
+            -C $env:RUNNER_TEMP leetcode-browser-profile
+          if ($LASTEXITCODE -ne 0) {
+            throw "Browser profile could not be archived."
+          }
+          & openssl enc -aes-256-cbc -salt -pbkdf2 -iter 200000 `
+            -in $archive -out $encrypted `
             -pass env:LEETCODE_CACHE_PASSWORD
-          rm -f "$archive"
-          echo "ready=true" >> "$GITHUB_OUTPUT"
+          if ($LASTEXITCODE -ne 0) {
+            throw "Browser profile could not be encrypted."
+          }
+          Remove-Item -LiteralPath $archive -Force
+          "ready=true" | Out-File -FilePath $env:GITHUB_OUTPUT `
+            -Encoding utf8 -Append
 
       - name: Save encrypted login state
         if: always() && steps.prepare-login-cache.outputs.ready == 'true'
