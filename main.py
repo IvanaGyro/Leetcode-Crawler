@@ -7,7 +7,6 @@ import getpass
 import json
 import os
 import re
-import subprocess
 import sys
 import time
 from dataclasses import dataclass
@@ -16,6 +15,14 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
 from curl_cffi.requests.exceptions import RequestException
+
+from errors import CrawlerError
+from git_operations import (
+    GitOperationError,
+    git_commit,
+    git_push,
+    open_submission_repository,
+)
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -56,7 +63,6 @@ LOGIN_ERROR_PHRASES = (
     "account is locked",
     "account has been locked",
 )
-
 
 USER_PROGRESS_QUERY = """
 query userProgressQuestionList($filters: UserProgressQuestionListInput) {
@@ -148,10 +154,6 @@ LANGUAGE_EXTENSIONS = {
     "swift": "swift",
     "typescript": "ts",
 }
-
-
-class CrawlerError(RuntimeError):
-    """A user-actionable crawler failure."""
 
 
 @dataclass(frozen=True)
@@ -892,92 +894,6 @@ def login(page: Any, settings: Settings) -> None:
     )
 
 
-def _run_git(
-    repo_path: Path,
-    arguments: Sequence[str],
-    *,
-    check: bool = True,
-) -> subprocess.CompletedProcess[str]:
-    result = subprocess.run(
-        ["git", "-C", str(repo_path), *arguments],
-        check=False,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-    )
-    if check and result.returncode != 0:
-        message = result.stderr.strip() or result.stdout.strip() or "unknown error"
-        raise CrawlerError(f"Git command failed: {message}")
-    return result
-
-
-def is_git_repository(path: Path) -> bool:
-    if not path.is_dir():
-        return False
-    result = _run_git(
-        path, ["rev-parse", "--is-inside-work-tree"], check=False
-    )
-    return result.returncode == 0 and result.stdout.strip() == "true"
-
-
-def git_commit(repo_path: Path, updated_files: Sequence[Path]) -> bool:
-    if not updated_files or not is_git_repository(repo_path):
-        return False
-    relative_files = sorted(
-        path.resolve().relative_to(repo_path.resolve()).as_posix()
-        for path in updated_files
-    )
-    _run_git(repo_path, ["add", "--", *relative_files])
-    diff = _run_git(
-        repo_path,
-        ["diff", "--cached", "--quiet", "--", *relative_files],
-        check=False,
-    )
-    if diff.returncode == 0:
-        return False
-    if diff.returncode != 1:
-        raise CrawlerError("Git could not inspect the staged submissions")
-
-    count = len(relative_files)
-    title = f"Update {count} answer" if count == 1 else f"Update {count} answers"
-    body = "Updated files:\n" + "\n".join(relative_files)
-    _run_git(
-        repo_path,
-        ["commit", "--only", "-m", title, "-m", body, "--", *relative_files],
-    )
-    return True
-
-
-def git_push(repo_path: Path) -> bool:
-    if not is_git_repository(repo_path):
-        print("Submissions were written, but submissions/ is not a Git repository.")
-        return False
-    has_head = _run_git(
-        repo_path, ["rev-parse", "--verify", "HEAD"], check=False
-    )
-    if has_head.returncode != 0:
-        return False
-    origin = _run_git(
-        repo_path, ["remote", "get-url", "origin"], check=False
-    )
-    if origin.returncode != 0:
-        print(
-            "Git commit created, but submissions/ has no origin remote; "
-            "push skipped."
-        )
-        return False
-
-    first_push = _run_git(repo_path, ["push"], check=False)
-    if first_push.returncode == 0:
-        return True
-    if "upstream branch" not in first_push.stderr.lower():
-        message = first_push.stderr.strip() or first_push.stdout.strip()
-        raise CrawlerError(f"Git push failed: {message}")
-    _run_git(repo_path, ["push", "--set-upstream", "origin", "HEAD"])
-    return True
-
-
 async def download_questions(
     client: LeetCodeClient,
     settings: Settings,
@@ -1116,6 +1032,38 @@ def launch_browser_context(playwright: Any, settings: Settings) -> Any:
             ) from second_error
 
 
+def finalize_download(
+    config: configparser.ConfigParser,
+    settings: Settings,
+    checkpoint: int,
+    submission_files: Sequence[Path],
+    watermark: int,
+) -> bool:
+    """Commit, optionally push, and advance the checkpoint when it is safe."""
+    repository_path = open_submission_repository(
+        settings.submissions_path, push_requested=settings.push
+    )
+    if repository_path is None:
+        committed = False
+        push_succeeded = not settings.push
+    else:
+        committed = git_commit(repository_path, submission_files)
+        push_succeeded = not settings.push or git_push(
+            repository_path, settings.submissions_path
+        )
+
+    if watermark > checkpoint:
+        if push_succeeded:
+            save_checkpoint(config, settings.config_path, watermark)
+        else:
+            print(
+                "The checkpoint was not advanced because the requested Git push "
+                "did not succeed.",
+                file=sys.stderr,
+            )
+    return committed
+
+
 def execute(args: argparse.Namespace) -> None:
     config = load_config(args.config.resolve())
     settings = resolve_settings(args, config)
@@ -1154,12 +1102,9 @@ def execute(args: argparse.Namespace) -> None:
         return
 
     submission_files, updated_count, watermark = result
-    committed = git_commit(settings.submissions_path, submission_files)
-    if settings.push:
-        git_push(settings.submissions_path)
-
-    if watermark > checkpoint:
-        save_checkpoint(config, settings.config_path, watermark)
+    committed = finalize_download(
+        config, settings, checkpoint, submission_files, watermark
+    )
 
     noun = "submission" if updated_count == 1 else "submissions"
     print(f"{updated_count} {noun} updated.")
@@ -1242,7 +1187,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         execute(args)
-    except (CrawlerError, KeyboardInterrupt) as exc:
+    except (CrawlerError, GitOperationError, KeyboardInterrupt) as exc:
         message = "Interrupted" if isinstance(exc, KeyboardInterrupt) else str(exc)
         print(f"Error: {message}", file=sys.stderr)
         return 1

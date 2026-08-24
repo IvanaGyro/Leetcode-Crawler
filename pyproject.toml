@@ -3,7 +3,7 @@ name = "leetcode-crawler"
 version = "0.1.0"
 description = "Download accepted LeetCode solutions and optionally commit and push them."
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 dependencies = [
     "curl-cffi==0.16.0",
     "patchright==1.61.2",
@@ -23,7 +23,9 @@ platforms = [
 ]
 
 [tool.pixi.tasks]
+crawl = { cmd = "python main.py", depends-on = ["install-browser"] }
 crawler = { cmd = "python main.py", depends-on = ["install-browser"] }
+push = "python git_operations.py"
 install-browser = "patchright install chromium"
 test = "python -m pytest"
 

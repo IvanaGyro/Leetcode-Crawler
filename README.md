@@ -6,7 +6,8 @@ it under `submissions/`, and optionally commit and push the changed files.
 ## Requirements
 
 - [Pixi](https://pixi.prefix.dev/)
-- Git (only needed for automatic commits and pushes)
+- Git for automatic commits and pushes. Install Git and ensure `git` is on
+  `PATH` before using those features.
 - Chrome, or Patchright's Chromium browser
 
 ## Configuration
@@ -16,17 +17,27 @@ email in `[User] Username` and your password in `[User] Password`. For
 non-interactive use, `LEETCODE_USERNAME` and `LEETCODE_PASSWORD` environment
 variables can be used instead and take precedence over `config.ini`.
 
-Create or clone the output repository if you want automatic Git commits:
+For automatic Git commits, initialize or clone a repository that contains
+`submissions/`. The folder may be the repository itself or a subfolder of it.
 
 ```powershell
+# Make submissions/ its own repository
 git init submissions
-# or: git clone <your-remote-repository> submissions
+
+# Or use a repository that contains submissions/
+git init my-solutions
 ```
+
+Configure `user.name` and `user.email` in the repository that receives the
+commits. The crawler delegates push selection to Git, so configure remotes and
+push settings normally. If a branch has no upstream, set one yourself, for
+example with `git push --set-upstream <remote> <branch>`, or enable
+`push.autoSetupRemote`. The crawler will not guess a first-push remote.
 
 ## Usage
 
 ```powershell
-pixi run crawler
+pixi run crawl
 ```
 
 LeetCode may show a CAPTCHA or Turnstile challenge. Complete it in the opened
@@ -40,25 +51,36 @@ Useful options:
 
 ```powershell
 # Verify authentication and all three GraphQL queries without writing anything
-pixi run crawler --check --no-push
+pixi run crawl --check --no-push
 
-# Download files without pushing them
-pixi run crawler --no-push
+# Download and commit files locally, without pushing them
+pixi run crawl --no-push
+
+# Push a previous no-push run after inspecting it
+pixi run push
 
 # Enter credentials and complete verification manually in the opened browser
-pixi run crawler --manual-login --no-push
+pixi run crawl --manual-login --no-push
 
 # Override the default eight concurrent solution downloads
-pixi run crawler --concurrency 4 --no-push
+pixi run crawl --concurrency 4 --no-push
 
 # CI mode (credentials must be in config.ini or environment variables)
-pixi run crawler --headless --non-interactive
+pixi run crawl --headless --non-interactive
 ```
 
-The checkpoint advances only after every requested solution is downloaded and
-the configured Git operation succeeds. A failed run is therefore safe to retry.
-`ConcurrentDownloads` in `[Browser]` accepts values from 1 through 32;
-`RequestDelaySeconds` is applied globally rather than once per worker.
+Running `pixi run crawl --no-push` followed by `pixi run push` has the same
+commit-and-push outcome as `pixi run crawl`, while allowing the local commit to
+be inspected before it is pushed.
+
+The checkpoint advances only after every requested solution is downloaded. When
+pushing is enabled, it advances only after `git push` succeeds. If the
+submission folder is not inside a Git worktree, Git is unavailable, no push
+target is configured, the branch has no upstream, or the push fails, the crawler
+explains the problem and keeps the checkpoint unchanged so the run can be
+retried safely. `ConcurrentDownloads` in `[Browser]` accepts values from 1
+through 32; `RequestDelaySeconds` is applied globally rather than once per
+worker.
 
 ## Testing
 

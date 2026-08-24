@@ -1,10 +1,12 @@
 import asyncio
 import configparser
 import subprocess
+import tomllib
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 
+import git_operations
 import main
 
 
@@ -428,8 +430,253 @@ def test_commit_contains_only_updated_submission_files(tmp_path):
     answer = repo / "0001_20240101_000000.py"
     answer.write_text("answer", encoding="utf-8")
 
-    assert main.git_commit(repo, [answer])
+    assert git_operations.git_commit(repo, [answer])
     committed = git("show", "--pretty=", "--name-only", "HEAD").stdout.splitlines()
     staged = git("diff", "--cached", "--name-only").stdout.splitlines()
     assert committed == [answer.name]
     assert staged == ["unrelated.txt"]
+
+
+def test_submission_subfolder_uses_containing_git_worktree(tmp_path):
+    repository = tmp_path / "repository"
+    submissions = repository / "submissions"
+    submissions.mkdir(parents=True)
+
+    def git(*arguments):
+        return subprocess.run(
+            ["git", "-C", str(repository), *arguments],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+    git("init", "--quiet")
+    git("config", "user.name", "Crawler Test")
+    git("config", "user.email", "crawler-test@example.invalid")
+    answer = submissions / "0001_20240101_000000.py"
+    answer.write_text("answer", encoding="utf-8")
+
+    worktree = git_operations.open_submission_repository(
+        submissions, push_requested=False
+    )
+
+    assert worktree == repository.resolve()
+    assert git_operations.git_commit(worktree, [answer])
+    assert git("show", "--pretty=", "--name-only", "HEAD").stdout.splitlines() == [
+        "submissions/0001_20240101_000000.py"
+    ]
+
+
+def test_missing_git_warns_without_running_a_git_command(tmp_path, capsys, mocker):
+    run = mocker.patch.object(git_operations.subprocess, "run")
+    mocker.patch.object(git_operations.shutil, "which", return_value=None)
+
+    repository = git_operations.open_submission_repository(
+        tmp_path, push_requested=True
+    )
+
+    assert repository is None
+    run.assert_not_called()
+    stderr = capsys.readouterr().err
+    assert "Install Git" in stderr
+    assert "no Git commands were run" in stderr
+    assert "checkpoint will not advance" in stderr
+
+
+def test_git_errors_are_not_crawler_errors():
+    error = git_operations.GitOperationError("Git failed")
+    unavailable = git_operations.GitUnavailableError("Git is unavailable")
+
+    assert not isinstance(error, main.CrawlerError)
+    assert isinstance(unavailable, git_operations.GitOperationError)
+    assert not isinstance(unavailable, main.CrawlerError)
+
+
+def test_git_command_failure_uses_git_operation_error(tmp_path, mocker):
+    mocker.patch.object(git_operations, "_git_is_available", return_value=True)
+    mocker.patch.object(
+        git_operations.subprocess,
+        "run",
+        return_value=subprocess.CompletedProcess(
+            ["git", "status"], 1, "", "repository error"
+        ),
+    )
+
+    try:
+        git_operations._run_git(tmp_path, ["status"])
+    except git_operations.GitOperationError as exc:
+        assert "repository error" in str(exc)
+    else:
+        raise AssertionError("Git command failure was not reported as a Git error")
+
+
+def test_main_reports_git_operation_errors(capsys, mocker):
+    mocker.patch.object(
+        main,
+        "execute",
+        side_effect=git_operations.GitOperationError("Git commit failed"),
+    )
+
+    assert main.main([]) == 1
+    assert "Error: Git commit failed" in capsys.readouterr().err
+
+
+def test_non_git_submission_folder_warns_clearly(tmp_path, capsys, mocker):
+    mocker.patch.object(git_operations, "_git_is_available", return_value=True)
+    mocker.patch.object(
+        git_operations,
+        "_run_git",
+        return_value=subprocess.CompletedProcess(
+            ["git", "rev-parse"], 128, "", "not a repository"
+        ),
+    )
+
+    repository = git_operations.open_submission_repository(
+        tmp_path, push_requested=True
+    )
+
+    assert repository is None
+    stderr = capsys.readouterr().err
+    assert "not inside a Git worktree" in stderr
+    assert "Initialize or clone" in stderr
+    assert "checkpoint will not advance" in stderr
+
+
+def test_push_runs_bare_git_push_without_remote_precheck(tmp_path, mocker):
+    run_git = mocker.patch.object(
+        git_operations,
+        "_run_git",
+        return_value=subprocess.CompletedProcess(["git", "push"], 0, "", ""),
+    )
+
+    assert git_operations.git_push(tmp_path, tmp_path)
+
+    run_git.assert_called_once_with(tmp_path, ["push"], check=False)
+
+
+def test_push_without_target_warns_clearly(tmp_path, capsys, mocker):
+    mocker.patch.object(
+        git_operations,
+        "_run_git",
+        return_value=subprocess.CompletedProcess(
+            ["git", "push"],
+            128,
+            "",
+            "fatal: No configured push destination.",
+        ),
+    )
+
+    assert not git_operations.git_push(tmp_path, tmp_path)
+
+    stderr = capsys.readouterr().err
+    assert "no configured push target" in stderr
+    assert "Configure a remote" in stderr
+    assert "checkpoint was not advanced" in stderr
+
+
+def test_push_without_upstream_does_not_guess_one(tmp_path, capsys, mocker):
+    mocker.patch.object(
+        git_operations,
+        "_run_git",
+        return_value=subprocess.CompletedProcess(
+            ["git", "push"],
+            128,
+            "",
+            "fatal: The current branch main has no upstream branch.",
+        ),
+    )
+
+    assert not git_operations.git_push(tmp_path, tmp_path)
+
+    stderr = capsys.readouterr().err
+    assert "has no upstream" in stderr
+    assert "--set-upstream <remote> <branch>" in stderr
+    assert "push.autoSetupRemote" in stderr
+    assert "will not choose a remote" in stderr
+
+
+def test_push_failure_warns_with_git_error(tmp_path, capsys, mocker):
+    mocker.patch.object(
+        git_operations,
+        "_run_git",
+        return_value=subprocess.CompletedProcess(
+            ["git", "push"], 1, "", "remote rejected the update"
+        ),
+    )
+
+    assert not git_operations.git_push(tmp_path, tmp_path)
+
+    stderr = capsys.readouterr().err
+    assert "Git push failed" in stderr
+    assert "remote rejected the update" in stderr
+    assert "checkpoint was not advanced" in stderr
+
+
+def _git_settings(tmp_path, *, push):
+    return main.Settings(
+        config_path=tmp_path / "config.ini",
+        submissions_path=tmp_path / "submissions",
+        browser_profile_path=tmp_path / ".browser-profile",
+        username="",
+        password="",
+        headless=True,
+        push=push,
+        browser_channel="chrome",
+        login_timeout_seconds=10,
+        request_delay_seconds=0,
+        manual_login=True,
+    )
+
+
+def test_failed_requested_push_does_not_advance_checkpoint(
+    tmp_path, capsys, mocker
+):
+    settings = _git_settings(tmp_path, push=True)
+    config = main.load_config(settings.config_path)
+    mocker.patch.object(main, "open_submission_repository", return_value=tmp_path)
+    mocker.patch.object(main, "git_commit", return_value=True)
+    mocker.patch.object(main, "git_push", return_value=False)
+    save_checkpoint = mocker.patch.object(main, "save_checkpoint")
+
+    committed = main.finalize_download(
+        config,
+        settings,
+        checkpoint=100,
+        submission_files=[settings.submissions_path / "answer.py"],
+        watermark=101,
+    )
+
+    assert committed
+    save_checkpoint.assert_not_called()
+    assert "checkpoint was not advanced" in capsys.readouterr().err
+
+
+def test_successful_requested_push_advances_checkpoint(tmp_path, mocker):
+    settings = _git_settings(tmp_path, push=True)
+    config = main.load_config(settings.config_path)
+    mocker.patch.object(main, "open_submission_repository", return_value=tmp_path)
+    mocker.patch.object(main, "git_commit", return_value=False)
+    mocker.patch.object(main, "git_push", return_value=True)
+    save_checkpoint = mocker.patch.object(main, "save_checkpoint")
+
+    main.finalize_download(
+        config,
+        settings,
+        checkpoint=100,
+        submission_files=[],
+        watermark=101,
+    )
+
+    save_checkpoint.assert_called_once_with(config, settings.config_path, 101)
+
+
+def test_pixi_tasks_support_split_crawl_and_push_workflow():
+    project = tomllib.loads(
+        (Path(main.__file__).resolve().parent / "pyproject.toml").read_text(
+            encoding="utf-8"
+        )
+    )
+    tasks = project["tool"]["pixi"]["tasks"]
+
+    assert "crawl" in tasks
+    assert tasks["push"] == "python git_operations.py"
