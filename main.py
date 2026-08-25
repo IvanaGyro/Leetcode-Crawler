@@ -9,6 +9,7 @@ import json
 import os
 import re
 import sys
+import threading
 import time
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
@@ -1287,6 +1288,24 @@ async def validate_authenticated_api(
             )
 
 
+def validate_authenticated_api_sync(
+    session_cookie: str, settings: Settings
+) -> None:
+    failures: list[BaseException] = []
+
+    def run_validation() -> None:
+        try:
+            asyncio.run(validate_authenticated_api(session_cookie, settings))
+        except BaseException as exc:
+            failures.append(exc)
+
+    thread = threading.Thread(target=run_validation)
+    thread.start()
+    thread.join()
+    if failures:
+        raise failures[0]
+
+
 async def run_authenticated(
     session_cookie: str,
     settings: Settings,
@@ -1522,9 +1541,7 @@ def execute(args: argparse.Namespace) -> None:
         session_cookie, settings = authenticate_with_proxies(
             playwright,
             settings,
-            lambda cookie, candidate_settings: asyncio.run(
-                validate_authenticated_api(cookie, candidate_settings)
-            ),
+            validate_authenticated_api_sync,
         )
 
     result = asyncio.run(

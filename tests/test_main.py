@@ -500,6 +500,22 @@ def test_proxy_rotation_validates_api_before_accepting_candidate(mocker):
     ]
 
 
+def test_sync_api_validation_works_while_an_event_loop_is_running(mocker):
+    settings = mocker.MagicMock(spec=main.Settings)
+    validate = mocker.patch.object(
+        main,
+        "validate_authenticated_api",
+        new=mocker.AsyncMock(return_value=None),
+    )
+
+    async def exercise():
+        main.validate_authenticated_api_sync("session-cookie", settings)
+
+    asyncio.run(exercise())
+
+    validate.assert_awaited_once_with("session-cookie", settings)
+
+
 def test_proxy_rotation_stops_on_credential_failure(mocker):
     proxies = (
         main.ProxySettings("http://proxy-one.example:80", "user-one", "password"),
