@@ -146,6 +146,49 @@ def test_downloads_use_bounded_concurrency(tmp_path, mocker):
     assert peak == 3
 
 
+def test_check_downloads_a_bounded_recent_sample(mocker, capsys):
+    questions = [
+        main.SolvedQuestion(str(index), f"Question {index}", str(index), index)
+        for index in range(1, 76)
+    ]
+    checked_slugs = []
+
+    async def fetch_submission(_client, title_slug):
+        checked_slugs.append(title_slug)
+        return main.Submission(int(title_slug), "python3", int(title_slug))
+
+    async def fetch_code(_client, submission_id):
+        return f"print({submission_id})\n", submission_id
+
+    mocker.patch.object(
+        main,
+        "fetch_solved_questions",
+        new=mocker.AsyncMock(return_value=questions),
+    )
+    mocker.patch.object(
+        main, "fetch_latest_accepted_submission", new=fetch_submission
+    )
+    mocker.patch.object(main, "fetch_submission_code", new=fetch_code)
+
+    asyncio.run(
+        main.run_check(mocker.MagicMock(), limit=50, concurrent_downloads=4)
+    )
+
+    assert set(checked_slugs) == {str(index) for index in range(26, 76)}
+    assert len(checked_slugs) == 50
+    assert (
+        "75 solved problems found and 50 submissions downloaded"
+        in capsys.readouterr().out
+    )
+
+
+def test_check_cli_defaults_to_one_submission_and_accepts_a_limit():
+    parser = main.build_parser()
+
+    assert parser.parse_args(["--check"]).check == 1
+    assert parser.parse_args(["--check", "50"]).check == 50
+
+
 def test_password_is_read_from_config(monkeypatch):
     config = main.load_config(Path("does-not-exist.ini"))
     config.set(main.SECTION_USER, main.USER_USERNAME, "configured-user")
@@ -189,6 +232,79 @@ def test_cli_concurrency_overrides_config():
     assert settings.concurrent_downloads == 2
 
 
+def test_cli_login_timeout_overrides_config():
+    config = main.load_config(Path("does-not-exist.ini"))
+    config.set(main.SECTION_BROWSER, "LoginTimeoutSeconds", "300")
+    args = SimpleNamespace(
+        config=Path("config.ini"),
+        submissions=Path("submissions"),
+        browser_profile=Path(".browser-profile"),
+        non_interactive=True,
+        headless=None,
+        push=False,
+        browser_channel=None,
+        manual_login=True,
+        login_timeout_seconds=30,
+    )
+
+    settings = main.resolve_settings(args, config)
+
+    assert settings.login_timeout_seconds == 30
+
+
+def test_proxy_list_is_read_from_one_environment_variable(monkeypatch):
+    monkeypatch.setenv(
+        "LEETCODE_PROXY_LIST",
+        "proxy-one.example:3128:user-one:password-one\n"
+        "proxy-two.example:8080:user-two:password:with:colons",
+    )
+
+    proxies = main.resolve_proxy_settings()
+
+    assert proxies == (
+        main.ProxySettings(
+            server="http://proxy-one.example:3128",
+            username="user-one",
+            password="password-one",
+        ),
+        main.ProxySettings(
+            server="http://proxy-two.example:8080",
+            username="user-two",
+            password="password:with:colons",
+        ),
+    )
+
+
+def test_proxy_list_rejects_an_invalid_entry_without_echoing_it(monkeypatch):
+    monkeypatch.setenv(
+        "LEETCODE_PROXY_LIST",
+        "proxy-user:proxy-password@proxy.example:3128",
+    )
+
+    try:
+        main.resolve_proxy_settings()
+    except main.CrawlerError as exc:
+        assert "entry 1" in str(exc)
+        assert "proxy-password" not in str(exc)
+    else:
+        raise AssertionError("invalid proxy list entry was accepted")
+
+
+def test_proxy_list_rejects_userinfo_in_the_host(monkeypatch):
+    monkeypatch.setenv(
+        "LEETCODE_PROXY_LIST",
+        "trusted.example@other.example:3128:proxy-user:proxy-password",
+    )
+
+    try:
+        main.resolve_proxy_settings()
+    except main.CrawlerError as exc:
+        assert "entry 1" in str(exc)
+        assert "other.example" not in str(exc)
+    else:
+        raise AssertionError("proxy host userinfo was accepted")
+
+
 def test_manual_login_does_not_read_configured_credentials(monkeypatch):
     config = main.load_config(Path("does-not-exist.ini"))
     config.set(main.SECTION_USER, main.USER_USERNAME, "configured-user")
@@ -211,6 +327,329 @@ def test_manual_login_does_not_read_configured_credentials(monkeypatch):
     assert settings.username == ""
     assert settings.password == ""
     assert settings.manual_login
+
+
+def test_browser_and_api_use_the_same_proxy(mocker):
+    proxy = main.ProxySettings(
+        server="http://proxy.example:3128",
+        username="proxy-user",
+        password="proxy-password",
+    )
+    settings = main.Settings(
+        config_path=Path("config.ini"),
+        submissions_path=Path("submissions"),
+        browser_profile_path=Path(".browser-profile"),
+        username="user",
+        password="password",
+        headless=False,
+        push=False,
+        browser_channel="chrome",
+        login_timeout_seconds=10,
+        request_delay_seconds=0,
+        manual_login=False,
+        proxy=proxy,
+    )
+    playwright = mocker.MagicMock()
+    browser_context = mocker.MagicMock()
+    playwright.chromium.launch_persistent_context.return_value = browser_context
+
+    assert main.launch_browser_context(playwright, settings) is browser_context
+    browser_options = playwright.chromium.launch_persistent_context.call_args.kwargs
+    assert browser_options["proxy"] == {
+        "server": proxy.server,
+        "username": proxy.username,
+        "password": proxy.password,
+    }
+
+    session = mocker.MagicMock()
+    session_context = mocker.MagicMock()
+    session_context.__aenter__ = mocker.AsyncMock(return_value=session)
+    session_context.__aexit__ = mocker.AsyncMock(return_value=None)
+    async_session = mocker.patch(
+        "curl_cffi.requests.AsyncSession", return_value=session_context
+    )
+    run_check = mocker.patch.object(
+        main, "run_check", new=mocker.AsyncMock(return_value=None)
+    )
+
+    result = asyncio.run(
+        main.run_authenticated("session-cookie", settings, checkpoint=0, check_limit=1)
+    )
+
+    assert result is None
+    api_options = async_session.call_args.kwargs
+    assert api_options["proxy"] == proxy.server
+    assert api_options["proxy_auth"] == (proxy.username, proxy.password)
+    run_check.assert_awaited_once()
+
+
+def test_proxy_login_retries_the_whole_list_for_two_rounds(mocker):
+    proxies = (
+        main.ProxySettings("http://proxy-one.example:80", "user-one", "password"),
+        main.ProxySettings("http://proxy-two.example:80", "user-two", "password"),
+    )
+    settings = main.Settings(
+        config_path=Path("config.ini"),
+        submissions_path=Path("submissions"),
+        browser_profile_path=Path(".browser-profile"),
+        username="user",
+        password="password",
+        headless=False,
+        push=False,
+        browser_channel=None,
+        login_timeout_seconds=15,
+        request_delay_seconds=0,
+        manual_login=False,
+        proxy_candidates=proxies,
+    )
+    authenticate = mocker.patch.object(
+        main,
+        "authenticate_candidate",
+        side_effect=[
+            main.CrawlerError("form failed"),
+            main.CrawlerError("form failed"),
+            main.CrawlerError("form failed"),
+            "session-cookie",
+        ],
+    )
+
+    session_cookie, selected = main.authenticate_with_proxies(
+        mocker.MagicMock(), settings
+    )
+
+    assert session_cookie == "session-cookie"
+    assert selected.proxy == proxies[1]
+    attempted_settings = [call.args[1] for call in authenticate.call_args_list]
+    assert [attempt.proxy for attempt in attempted_settings] == [
+        proxies[0],
+        proxies[1],
+        proxies[0],
+        proxies[1],
+    ]
+    assert attempted_settings[0].browser_profile_path == attempted_settings[2].browser_profile_path
+    assert attempted_settings[0].browser_profile_path != attempted_settings[1].browser_profile_path
+
+
+def test_proxy_profiles_are_isolated_by_leetcode_account():
+    proxy = main.ProxySettings(
+        "http://proxy.example:80", "proxy-user", "proxy-password"
+    )
+    first_account = main.Settings(
+        config_path=Path("config.ini"),
+        submissions_path=Path("submissions"),
+        browser_profile_path=Path(".browser-profile"),
+        username="first-account",
+        password="password",
+        headless=False,
+        push=False,
+        browser_channel=None,
+        login_timeout_seconds=15,
+        request_delay_seconds=0,
+        manual_login=False,
+    )
+    second_account = main.replace(first_account, username="second-account")
+
+    first_profile = main.settings_for_proxy(
+        first_account, proxy
+    ).browser_profile_path
+    second_profile = main.settings_for_proxy(
+        second_account, proxy
+    ).browser_profile_path
+
+    assert first_profile != second_profile
+
+
+def test_proxy_rotation_validates_api_before_accepting_candidate(mocker):
+    proxies = (
+        main.ProxySettings("http://proxy-one.example:80", "user-one", "password"),
+        main.ProxySettings("http://proxy-two.example:80", "user-two", "password"),
+    )
+    settings = main.Settings(
+        config_path=Path("config.ini"),
+        submissions_path=Path("submissions"),
+        browser_profile_path=Path(".browser-profile"),
+        username="user",
+        password="password",
+        headless=False,
+        push=False,
+        browser_channel=None,
+        login_timeout_seconds=15,
+        request_delay_seconds=0,
+        manual_login=False,
+        proxy_candidates=proxies,
+    )
+    authenticate = mocker.patch.object(
+        main,
+        "authenticate_candidate",
+        side_effect=["first-cookie", "second-cookie"],
+    )
+    validate = mocker.Mock(
+        side_effect=[main.CrawlerError("API connection failed"), None]
+    )
+
+    session_cookie, selected = main.authenticate_with_proxies(
+        mocker.MagicMock(), settings, validate
+    )
+
+    assert session_cookie == "second-cookie"
+    assert selected.proxy == proxies[1]
+    assert authenticate.call_count == 2
+    assert [call.args[0] for call in validate.call_args_list] == [
+        "first-cookie",
+        "second-cookie",
+    ]
+
+
+def test_rejected_session_is_cleared_before_profile_retry(mocker):
+    proxy = main.ProxySettings(
+        "http://proxy.example:80", "proxy-user", "proxy-password"
+    )
+    settings = main.Settings(
+        config_path=Path("config.ini"),
+        submissions_path=Path("submissions"),
+        browser_profile_path=Path(".browser-profile"),
+        username="user",
+        password="password",
+        headless=False,
+        push=False,
+        browser_channel=None,
+        login_timeout_seconds=15,
+        request_delay_seconds=0,
+        manual_login=False,
+        proxy_candidates=(proxy,),
+    )
+    authenticate = mocker.patch.object(
+        main,
+        "authenticate_candidate",
+        side_effect=["stale-cookie", "fresh-cookie"],
+    )
+    validate = mocker.Mock(
+        side_effect=[main.CrawlerError("session rejected"), None]
+    )
+
+    session_cookie, selected = main.authenticate_with_proxies(
+        mocker.MagicMock(), settings, validate
+    )
+
+    assert session_cookie == "fresh-cookie"
+    first_attempt = authenticate.call_args_list[0].args[1]
+    second_attempt = authenticate.call_args_list[1].args[1]
+    assert not first_attempt.force_session_refresh
+    assert second_attempt.force_session_refresh
+    assert first_attempt.browser_profile_path == second_attempt.browser_profile_path
+    assert selected.force_session_refresh
+
+
+def test_forced_session_refresh_clears_cookie_before_login(mocker):
+    page = mocker.MagicMock()
+    page.context.cookies.return_value = [
+        {"name": "LEETCODE_SESSION", "value": "fresh-session"}
+    ]
+    settings = main.Settings(
+        config_path=Path("config.ini"),
+        submissions_path=Path("submissions"),
+        browser_profile_path=Path(".browser-profile"),
+        username="",
+        password="",
+        headless=False,
+        push=False,
+        browser_channel=None,
+        login_timeout_seconds=15,
+        request_delay_seconds=0,
+        manual_login=True,
+        force_session_refresh=True,
+    )
+
+    main.login(page, settings)
+
+    page.context.clear_cookies.assert_called_once_with(
+        name=main.LEETCODE_SESSION_COOKIE
+    )
+    assert page.goto.call_args_list == [
+        mocker.call(main.LOGIN_URL, wait_until="domcontentloaded"),
+        mocker.call(main.LEETCODE_URL, wait_until="domcontentloaded"),
+    ]
+
+
+def test_sync_api_validation_works_while_an_event_loop_is_running(mocker):
+    settings = mocker.MagicMock(spec=main.Settings)
+    validate = mocker.patch.object(
+        main,
+        "validate_authenticated_api",
+        new=mocker.AsyncMock(return_value=None),
+    )
+
+    async def exercise():
+        main.validate_authenticated_api_sync("session-cookie", settings)
+
+    asyncio.run(exercise())
+
+    validate.assert_awaited_once_with("session-cookie", settings)
+
+
+def test_proxy_rotation_stops_on_credential_failure(mocker):
+    proxies = (
+        main.ProxySettings("http://proxy-one.example:80", "user-one", "password"),
+        main.ProxySettings("http://proxy-two.example:80", "user-two", "password"),
+    )
+    settings = main.Settings(
+        config_path=Path("config.ini"),
+        submissions_path=Path("submissions"),
+        browser_profile_path=Path(".browser-profile"),
+        username="user",
+        password="bad-password",
+        headless=False,
+        push=False,
+        browser_channel=None,
+        login_timeout_seconds=15,
+        request_delay_seconds=0,
+        manual_login=False,
+        proxy_candidates=proxies,
+    )
+    authenticate = mocker.patch.object(
+        main,
+        "authenticate_candidate",
+        side_effect=main.CredentialError("incorrect username or password"),
+    )
+
+    try:
+        main.authenticate_with_proxies(mocker.MagicMock(), settings)
+    except main.CredentialError as exc:
+        assert "incorrect username or password" in str(exc)
+    else:
+        raise AssertionError("credential failure did not stop proxy rotation")
+
+    authenticate.assert_called_once()
+
+
+def test_direct_login_preserves_the_original_failure(mocker):
+    settings = main.Settings(
+        config_path=Path("config.ini"),
+        submissions_path=Path("submissions"),
+        browser_profile_path=Path(".browser-profile"),
+        username="user",
+        password="password",
+        headless=False,
+        push=False,
+        browser_channel=None,
+        login_timeout_seconds=15,
+        request_delay_seconds=0,
+        manual_login=False,
+    )
+    authenticate = mocker.patch.object(
+        main,
+        "authenticate_candidate",
+        side_effect=main.CrawlerError("The Chrome window was closed"),
+    )
+
+    try:
+        main.authenticate_with_proxies(mocker.MagicMock(), settings)
+    except main.CrawlerError as exc:
+        assert str(exc) == "The Chrome window was closed"
+    else:
+        raise AssertionError("direct login failure was replaced")
+
+    authenticate.assert_called_once()
 
 
 def test_session_cookie_is_sufficient_even_before_redirect():
@@ -250,11 +689,259 @@ def test_cloudflare_messages_are_not_treated_as_credential_errors():
     )
 
 
+def test_cloudflare_frame_owner_clicks_visible_widget(mocker):
+    page = mocker.MagicMock()
+    ordinary_frame = mocker.MagicMock()
+    ordinary_frame.url = "https://leetcode.com/accounts/login/"
+    challenge_frame = mocker.MagicMock()
+    challenge_frame.url = (
+        "https://challenges.cloudflare.com/cdn-cgi/challenge-platform/widget"
+    )
+    challenge_frame.frame_element.return_value.bounding_box.return_value = {
+        "x": 10,
+        "y": 20,
+        "width": 300,
+        "height": 65,
+    }
+    page.frames = [ordinary_frame, challenge_frame]
+
+    clicked = main._click_cloudflare_challenge_frame(page)
+
+    assert clicked
+    page.mouse.move.assert_called_once_with(40.0, 52.0, steps=8)
+    page.mouse.click.assert_called_once_with(40.0, 52.0)
+
+
+def test_cloudflare_cdp_click_pierces_closed_shadow_roots(mocker):
+    page = mocker.MagicMock()
+    page.frames = []
+    turnstile = mocker.MagicMock()
+    turnstile.count.return_value = 0
+    page.locator.return_value = turnstile
+    cdp = page.context.new_cdp_session.return_value
+    cdp.send.side_effect = [
+        {
+            "root": {
+                "nodeName": "#document",
+                "shadowRoots": [
+                    {
+                        "nodeName": "#document-fragment",
+                        "children": [
+                            {
+                                "nodeName": "IFRAME",
+                                "attributes": [
+                                    "src",
+                                    "https://challenges.cloudflare.com/widget",
+                                ],
+                                "contentDocument": {
+                                    "nodeName": "#document",
+                                    "shadowRoots": [
+                                        {
+                                            "nodeName": "#document-fragment",
+                                            "children": [
+                                                {
+                                                    "nodeName": "INPUT",
+                                                    "attributes": [
+                                                        "type",
+                                                        "checkbox",
+                                                    ],
+                                                    "backendNodeId": 42,
+                                                }
+                                            ],
+                                        }
+                                    ],
+                                },
+                            }
+                        ],
+                    }
+                ],
+            }
+        },
+        {
+            "model": {
+                "border": [10, 20, 30, 20, 30, 40, 10, 40],
+            }
+        },
+    ]
+
+    clicked = main.maybe_click_cloudflare(page)
+
+    assert clicked
+    assert cdp.send.call_args_list == [
+        mocker.call("DOM.getDocument", {"depth": -1, "pierce": True}),
+        mocker.call("DOM.getBoxModel", {"backendNodeId": 42}),
+    ]
+    page.mouse.move.assert_called_once_with(20.0, 30.0, steps=12)
+    page.mouse.click.assert_called_once_with(20.0, 30.0)
+    cdp.detach.assert_called_once_with()
+
+
+def test_cloudflare_click_is_skipped_after_turnstile_produces_token(mocker):
+    page = mocker.MagicMock()
+    turnstile = page.locator.return_value
+    turnstile.count.return_value = 1
+    turnstile.first.input_value.return_value = "verified-token"
+
+    clicked = main.maybe_click_cloudflare(page)
+
+    assert not clicked
+    page.context.new_cdp_session.assert_not_called()
+    page.mouse.click.assert_not_called()
+
+
+def test_login_polls_and_clicks_cloudflare_before_form_appears(mocker):
+    page = mocker.MagicMock()
+    page.url = main.LOGIN_URL
+    clock = [0.0]
+    mocker.patch.object(main.time, "monotonic", side_effect=lambda: clock[0])
+    challenge_click = mocker.patch.object(
+        main, "maybe_click_cloudflare", return_value=True
+    )
+
+    username = mocker.MagicMock()
+    username.is_visible.side_effect = [False, False, True]
+    password = mocker.MagicMock()
+    button = mocker.MagicMock()
+    page.locator.side_effect = {
+        "#id_login": username,
+        "#id_password": password,
+        "#signin_btn": button,
+    }.__getitem__
+    page.wait_for_timeout.side_effect = lambda milliseconds: clock.__setitem__(
+        0, clock[0] + milliseconds / 1_000
+    )
+    page.context.cookies.side_effect = [
+        [],
+        [{"name": "LEETCODE_SESSION", "value": "session"}],
+    ]
+    settings = main.Settings(
+        config_path=Path("config.ini"),
+        submissions_path=Path("submissions"),
+        browser_profile_path=Path(".browser-profile"),
+        username="user",
+        password="password",
+        headless=False,
+        push=False,
+        browser_channel="chrome",
+        login_timeout_seconds=10,
+        request_delay_seconds=0,
+        manual_login=False,
+    )
+
+    main.login(page, settings)
+
+    assert username.is_visible.call_count == 3
+    challenge_click.assert_called_once_with(page)
+    username.fill.assert_called_once_with("user")
+    password.fill.assert_called_once_with("password")
+    page.goto.assert_any_call(main.LEETCODE_URL, wait_until="domcontentloaded")
+
+
+def test_login_refreshes_form_deadline_after_cloudflare_click(mocker):
+    page = mocker.MagicMock()
+    page.url = main.LOGIN_URL
+    clock = [0.0]
+    mocker.patch.object(main.time, "monotonic", side_effect=lambda: clock[0])
+    challenge_click = mocker.patch.object(
+        main,
+        "maybe_click_cloudflare",
+        side_effect=lambda _page: clock[0] >= 8,
+    )
+
+    username = mocker.MagicMock()
+    username.is_visible.side_effect = lambda: clock[0] >= 12
+    password = mocker.MagicMock()
+    button = mocker.MagicMock()
+    page.locator.side_effect = {
+        "#id_login": username,
+        "#id_password": password,
+        "#signin_btn": button,
+    }.__getitem__
+    page.wait_for_timeout.side_effect = lambda milliseconds: clock.__setitem__(
+        0, clock[0] + milliseconds / 1_000
+    )
+    page.context.cookies.side_effect = [
+        [],
+        [{"name": "LEETCODE_SESSION", "value": "session"}],
+    ]
+    settings = main.Settings(
+        config_path=Path("config.ini"),
+        submissions_path=Path("submissions"),
+        browser_profile_path=Path(".browser-profile"),
+        username="user",
+        password="password",
+        headless=False,
+        push=False,
+        browser_channel="chrome",
+        login_timeout_seconds=10,
+        request_delay_seconds=0,
+        manual_login=False,
+    )
+
+    main.login(page, settings)
+
+    assert clock[0] == 12
+    assert challenge_click.call_count == 6
+    username.fill.assert_called_once_with("user")
+    password.fill.assert_called_once_with("password")
+
+
+def test_login_rechecks_form_when_it_appears_at_deadline(mocker):
+    page = mocker.MagicMock()
+    page.url = main.LOGIN_URL
+    clock = [0.0]
+    mocker.patch.object(main.time, "monotonic", side_effect=lambda: clock[0])
+    mocker.patch.object(main, "maybe_click_cloudflare", return_value=False)
+
+    username = mocker.MagicMock()
+    username.is_visible.side_effect = lambda: clock[0] >= 1
+    password = mocker.MagicMock()
+    button = mocker.MagicMock()
+    page.locator.side_effect = {
+        "#id_login": username,
+        "#id_password": password,
+        "#signin_btn": button,
+    }.__getitem__
+    page.wait_for_timeout.side_effect = lambda milliseconds: clock.__setitem__(
+        0, clock[0] + milliseconds / 1_000
+    )
+    page.context.cookies.side_effect = [
+        [],
+        [{"name": "LEETCODE_SESSION", "value": "session"}],
+    ]
+    settings = main.Settings(
+        config_path=Path("config.ini"),
+        submissions_path=Path("submissions"),
+        browser_profile_path=Path(".browser-profile"),
+        username="user",
+        password="password",
+        headless=False,
+        push=False,
+        browser_channel="chrome",
+        login_timeout_seconds=1,
+        request_delay_seconds=0,
+        manual_login=False,
+    )
+
+    main.login(page, settings)
+
+    assert clock[0] == 1
+    assert username.is_visible.call_count == 3
+    username.fill.assert_called_once_with("user")
+    password.fill.assert_called_once_with("password")
+
+
 def test_login_waits_for_cloudflare_to_enable_sign_in(mocker):
     page = mocker.MagicMock()
     page.url = main.LOGIN_URL
+    clock = [0.0]
+    mocker.patch.object(main.time, "monotonic", side_effect=lambda: clock[0])
 
+    challenge_click = mocker.patch.object(
+        main, "maybe_click_cloudflare", return_value=False
+    )
     username = mocker.MagicMock()
+    username.is_visible.side_effect = [False] * 18 + [True]
     password = mocker.MagicMock()
     button = mocker.MagicMock()
     button.is_visible.return_value = True
@@ -272,6 +959,9 @@ def test_login_waits_for_cloudflare_to_enable_sign_in(mocker):
         "input[name='cf-turnstile-response']": turnstile,
     }
     page.locator.side_effect = locators.__getitem__
+    page.wait_for_timeout.side_effect = lambda milliseconds: clock.__setitem__(
+        0, clock[0] + milliseconds / 1_000
+    )
     page.context.cookies.side_effect = [
         [],
         [],
@@ -298,6 +988,8 @@ def test_login_waits_for_cloudflare_to_enable_sign_in(mocker):
 
     assert button.is_enabled.call_count == 3
     button.click.assert_called_once_with(timeout=5_000)
+    assert username.is_visible.call_count == 19
+    assert challenge_click.call_count == 5
     page.goto.assert_any_call(main.LEETCODE_URL, wait_until="domcontentloaded")
 
 
@@ -351,6 +1043,27 @@ def test_graphql_request_retries_rate_limits(mocker):
     assert data == {"answer": 42}
     assert session.post.await_count == 2
     defer_requests.assert_awaited_once_with(0.5)
+
+
+def test_graphql_request_failure_does_not_expose_proxy_endpoint(mocker):
+    mocker.patch.object(main, "GRAPHQL_RETRIES", 1)
+    session = mocker.MagicMock()
+    session.post = mocker.AsyncMock(
+        side_effect=main.RequestException(
+            "Could not connect to secret-proxy.example:3128"
+        )
+    )
+    client = main.LeetCodeClient(session, "session-value", 0)
+
+    try:
+        asyncio.run(client.graphql_request("operation", "query", {}))
+    except main.CrawlerError as exc:
+        message = str(exc)
+        assert "secret-proxy.example" not in message
+        assert "3128" not in message
+        assert "failed after 1 attempts" in message
+    else:
+        raise AssertionError("request failure did not reach the caller")
 
 
 def test_global_cooldown_extends_a_pending_request(mocker):

@@ -4,15 +4,18 @@ import argparse
 import asyncio
 import configparser
 import getpass
+import hashlib
 import json
 import os
 import re
 import sys
+import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Callable, Iterable, Mapping, Sequence
+from urllib.parse import urlsplit
 
 from curl_cffi.requests.exceptions import RequestException
 
@@ -23,6 +26,10 @@ from git_operations import (
     git_push,
     open_submission_repository,
 )
+
+
+class CredentialError(CrawlerError):
+    """LeetCode rejected the configured account credentials."""
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -52,6 +59,10 @@ GRAPHQL_RETRIES = 5
 LEETCODE_SESSION_COOKIE = "LEETCODE_SESSION"
 DEFAULT_CONCURRENT_DOWNLOADS = 8
 MAX_CONCURRENT_DOWNLOADS = 32
+PROXY_LOGIN_ROUNDS = 2
+CLOUDFLARE_CHALLENGE_HOST = "challenges.cloudflare.com"
+CLOUDFLARE_CLICK_COOLDOWN_SECONDS = 2.0
+LOGIN_POLL_INTERVAL_MS = 500
 
 LOGIN_ERROR_PHRASES = (
     "incorrect username",
@@ -172,6 +183,13 @@ class Submission:
 
 
 @dataclass(frozen=True)
+class ProxySettings:
+    server: str
+    username: str = ""
+    password: str = ""
+
+
+@dataclass(frozen=True)
 class Settings:
     config_path: Path
     submissions_path: Path
@@ -185,6 +203,9 @@ class Settings:
     request_delay_seconds: float
     manual_login: bool
     concurrent_downloads: int = DEFAULT_CONCURRENT_DOWNLOADS
+    proxy: ProxySettings | None = None
+    proxy_candidates: tuple[ProxySettings, ...] = ()
+    force_session_refresh: bool = False
 
 
 def load_config(path: Path) -> configparser.ConfigParser:
@@ -284,6 +305,62 @@ def _config_bool(
         raise CrawlerError(f"[{section}] {option} must be true or false") from exc
 
 
+def resolve_proxy_settings() -> tuple[ProxySettings, ...]:
+    raw_proxy_list = os.environ.get("LEETCODE_PROXY_LIST", "")
+    proxies: list[ProxySettings] = []
+
+    for line_number, raw_line in enumerate(raw_proxy_list.splitlines(), start=1):
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        try:
+            host, port_text, username, password = line.split(":", 3)
+        except ValueError as exc:
+            raise CrawlerError(
+                "LEETCODE_PROXY_LIST entry "
+                f"{line_number} must use domain:port:username:password"
+            ) from exc
+
+        host = host.strip()
+        port_text = port_text.strip()
+        username = username.strip()
+        if (
+            not host
+            or "://" in host
+            or not port_text.isdigit()
+            or not username
+            or not password
+        ):
+            raise CrawlerError(
+                f"LEETCODE_PROXY_LIST entry {line_number} is invalid"
+            )
+
+        port = int(port_text)
+        server = f"http://{host}:{port}"
+        try:
+            parsed = urlsplit(server)
+            valid_server = (
+                parsed.scheme == "http"
+                and parsed.hostname is not None
+                and parsed.username is None
+                and parsed.password is None
+                and parsed.port == port
+                and 1 <= port <= 65_535
+            )
+        except ValueError:
+            valid_server = False
+        if not valid_server:
+            raise CrawlerError(
+                f"LEETCODE_PROXY_LIST entry {line_number} is invalid"
+            )
+
+        proxies.append(
+            ProxySettings(server=server, username=username, password=password)
+        )
+
+    return tuple(proxies)
+
+
 def resolve_settings(
     args: argparse.Namespace, config: configparser.ConfigParser
 ) -> Settings:
@@ -332,7 +409,7 @@ def resolve_settings(
     channel = channel or None
 
     try:
-        login_timeout = config.getint(
+        configured_login_timeout = config.getint(
             SECTION_BROWSER, "LoginTimeoutSeconds", fallback=300
         )
         request_delay = config.getfloat(
@@ -348,6 +425,12 @@ def resolve_settings(
             "Browser timeout, request delay, and concurrency settings must be numeric"
         ) from exc
     concurrency_argument = getattr(args, "concurrency", None)
+    login_timeout_argument = getattr(args, "login_timeout_seconds", None)
+    login_timeout = (
+        configured_login_timeout
+        if login_timeout_argument is None
+        else login_timeout_argument
+    )
     concurrency = (
         configured_concurrency
         if concurrency_argument is None
@@ -375,6 +458,7 @@ def resolve_settings(
         request_delay_seconds=request_delay,
         concurrent_downloads=concurrency,
         manual_login=args.manual_login,
+        proxy_candidates=resolve_proxy_settings(),
     )
 
 
@@ -525,7 +609,7 @@ class LeetCodeClient:
                 if attempt == GRAPHQL_RETRIES - 1:
                     raise CrawlerError(
                         f"LeetCode request {operation_name!r} failed after "
-                        f"{GRAPHQL_RETRIES} attempts: {exc}"
+                        f"{GRAPHQL_RETRIES} attempts"
                     ) from exc
                 await asyncio.sleep(min(2**attempt, 30))
                 continue
@@ -725,17 +809,142 @@ def _turnstile_response(page: Any) -> str:
         return ""
 
 
+def _node_attributes(node: Mapping[str, Any]) -> dict[str, str]:
+    raw_attributes = list(node.get("attributes") or [])
+    return {
+        str(raw_attributes[index]): str(raw_attributes[index + 1])
+        for index in range(0, len(raw_attributes) - 1, 2)
+    }
+
+
+def _find_cloudflare_checkbox(
+    node: Mapping[str, Any], in_cloudflare_frame: bool = False
+) -> Mapping[str, Any] | None:
+    attributes = _node_attributes(node)
+    node_name = str(node.get("nodeName") or "").upper()
+    if node_name == "IFRAME":
+        in_cloudflare_frame = in_cloudflare_frame or (
+            CLOUDFLARE_CHALLENGE_HOST in attributes.get("src", "")
+        )
+
+    if (
+        in_cloudflare_frame
+        and node_name == "INPUT"
+        and attributes.get("type", "").lower() == "checkbox"
+    ):
+        return node
+
+    children = list(node.get("children") or [])
+    children.extend(node.get("shadowRoots") or [])
+    content_document = node.get("contentDocument")
+    if content_document:
+        children.append(content_document)
+
+    for child in children:
+        if not isinstance(child, Mapping):
+            continue
+        checkbox = _find_cloudflare_checkbox(child, in_cloudflare_frame)
+        if checkbox is not None:
+            return checkbox
+    return None
+
+
+def _click_cloudflare_challenge_frame(page: Any) -> bool:
+    for frame in tuple(page.frames):
+        try:
+            if urlsplit(frame.url).hostname != CLOUDFLARE_CHALLENGE_HOST:
+                continue
+            owner = frame.frame_element()
+            box = owner.bounding_box()
+            if not box:
+                continue
+            width = float(box["width"])
+            height = float(box["height"])
+            if width < 100 or not 40 <= height <= 180:
+                continue
+            x = float(box["x"]) + min(30.0, max(15.0, width * 0.10))
+            y = float(box["y"]) + min(32.0, height * 0.50)
+            page.mouse.move(x, y, steps=8)
+            page.wait_for_timeout(120)
+            page.mouse.click(x, y)
+            return True
+        except Exception:
+            # Challenge frames are transient and can be replaced mid-poll.
+            continue
+    return False
+
+
+def _click_cloudflare_checkbox_via_cdp(page: Any) -> bool:
+    cdp = None
+    try:
+        cdp = page.context.new_cdp_session(page)
+        document = cdp.send(
+            "DOM.getDocument", {"depth": -1, "pierce": True}
+        )
+        root = document.get("root")
+        if not isinstance(root, Mapping):
+            return False
+        checkbox = _find_cloudflare_checkbox(root)
+        if checkbox is None or checkbox.get("backendNodeId") is None:
+            return False
+
+        response = cdp.send(
+            "DOM.getBoxModel",
+            {"backendNodeId": checkbox["backendNodeId"]},
+        )
+        model = response.get("model") or {}
+        border = list(model.get("border") or [])
+        if len(border) < 8:
+            return False
+        x = sum(float(value) for value in border[0:8:2]) / 4
+        y = sum(float(value) for value in border[1:8:2]) / 4
+        page.mouse.move(x, y, steps=12)
+        page.wait_for_timeout(120)
+        page.mouse.click(x, y)
+        return True
+    except Exception:
+        # Shadow roots and challenge nodes can be replaced while traversing.
+        return False
+    finally:
+        if cdp is not None:
+            try:
+                cdp.detach()
+            except Exception:
+                pass
+
+
+def maybe_click_cloudflare(page: Any) -> bool:
+    # Do not disturb a challenge that has already produced a valid token.
+    if _turnstile_response(page):
+        return False
+    if _click_cloudflare_challenge_frame(page):
+        return True
+    return _click_cloudflare_checkbox_via_cdp(page)
+
+
 def login(page: Any, settings: Settings) -> None:
-    if has_leetcode_session(page.context.cookies([LEETCODE_URL])):
+    if settings.force_session_refresh:
+        try:
+            page.context.clear_cookies(name=LEETCODE_SESSION_COOKIE)
+        except Exception as exc:
+            raise CrawlerError(
+                "Could not clear the rejected LeetCode session before retrying."
+            ) from exc
+    elif has_leetcode_session(page.context.cookies([LEETCODE_URL])):
         page.goto(LEETCODE_URL, wait_until="domcontentloaded")
         return
 
     page.goto(LOGIN_URL, wait_until="domcontentloaded")
+    deadline = time.monotonic() + settings.login_timeout_seconds
+
+    def remaining_timeout_ms(cap: int | None = None) -> int:
+        remaining = max(1, int((deadline - time.monotonic()) * 1_000))
+        return remaining if cap is None else min(remaining, cap)
+
     if settings.manual_login:
         print(
             "Sign in manually in the browser and complete Cloudflare verification."
         )
-        deadline = time.monotonic() + settings.login_timeout_seconds
         while time.monotonic() < deadline:
             cookies = page.context.cookies([LEETCODE_URL])
             if has_leetcode_session(cookies):
@@ -749,17 +958,53 @@ def login(page: Any, settings: Settings) -> None:
     username_field = page.locator("#id_login")
     password_field = page.locator("#id_password")
     sign_in_button = page.locator("#signin_btn")
+    last_challenge_attempt_at = float("-inf")
+
+    def attempt_cloudflare_click() -> bool:
+        nonlocal last_challenge_attempt_at
+        now = time.monotonic()
+        if (
+            now - last_challenge_attempt_at
+            < CLOUDFLARE_CLICK_COOLDOWN_SECONDS
+        ):
+            return False
+        last_challenge_attempt_at = now
+        return maybe_click_cloudflare(page)
 
     print("Waiting for LeetCode. Complete any Cloudflare verification shown.")
-    try:
-        username_field.wait_for(
-            state="visible", timeout=settings.login_timeout_seconds * 1_000
+    form_is_visible = False
+    form_deadline_refreshed = False
+    while time.monotonic() < deadline:
+        try:
+            form_is_visible = username_field.is_visible()
+        except Exception:
+            form_is_visible = False
+        if form_is_visible:
+            break
+        challenge_was_clicked = attempt_cloudflare_click()
+        if challenge_was_clicked and not form_deadline_refreshed:
+            # Give the page one complete loading window after interacting with
+            # a pre-form challenge, without allowing repeated clicks to wait
+            # forever.
+            deadline = time.monotonic() + settings.login_timeout_seconds
+            form_deadline_refreshed = True
+        page.wait_for_timeout(
+            min(LOGIN_POLL_INTERVAL_MS, remaining_timeout_ms())
         )
-    except Exception as exc:
+    if not form_is_visible:
+        # The form can appear during the last poll sleep exactly as the
+        # deadline expires. Check once more before reporting a timeout.
+        try:
+            form_is_visible = username_field.is_visible()
+        except Exception:
+            form_is_visible = False
+    if not form_is_visible:
         raise CrawlerError(
             "The LeetCode login form did not load after Cloudflare verification."
-        ) from exc
+        )
 
+    # Each automated-login phase receives its own timeout budget. A slow proxy
+    # that used most of the form-loading budget still gets the full button wait.
     deadline = time.monotonic() + settings.login_timeout_seconds
     username_field.fill(settings.username)
     password_field.fill(settings.password)
@@ -779,24 +1024,25 @@ def login(page: Any, settings: Settings) -> None:
         last_messages = _visible_login_messages(page)
         explicit_error = credential_error(last_messages)
         if explicit_error:
-            raise CrawlerError(f"LeetCode login failed: {explicit_error}")
+            raise CredentialError(f"LeetCode login failed: {explicit_error}")
 
         try:
             button_is_ready = (
                 sign_in_button.is_visible()
-                and sign_in_button.is_enabled(timeout=1_000)
+                and sign_in_button.is_enabled(timeout=remaining_timeout_ms(1_000))
             )
         except Exception:
             button_is_ready = False
         if button_is_ready:
             try:
-                sign_in_button.click(timeout=5_000)
+                sign_in_button.click(timeout=remaining_timeout_ms(5_000))
                 initial_click_completed = True
                 break
             except Exception:
                 # The user may have clicked at the same moment and started navigation.
                 pass
-        page.wait_for_timeout(500)
+        attempt_cloudflare_click()
+        page.wait_for_timeout(LOGIN_POLL_INTERVAL_MS)
 
     if not initial_click_completed:
         cookies = page.context.cookies([LEETCODE_URL])
@@ -826,19 +1072,20 @@ def login(page: Any, settings: Settings) -> None:
             page.goto(LEETCODE_URL, wait_until="domcontentloaded")
             return
 
+        attempt_cloudflare_click()
         try:
             form_is_visible = username_field.is_visible()
         except Exception:
             form_is_visible = False
         if not form_is_visible:
             form_was_hidden = True
-            page.wait_for_timeout(500)
+            page.wait_for_timeout(LOGIN_POLL_INTERVAL_MS)
             continue
 
         last_messages = _visible_login_messages(page)
         explicit_error = credential_error(last_messages)
         if explicit_error:
-            raise CrawlerError(f"LeetCode login failed: {explicit_error}")
+            raise CredentialError(f"LeetCode login failed: {explicit_error}")
 
         now = time.monotonic()
         turnstile_response = _turnstile_response(page)
@@ -870,7 +1117,7 @@ def login(page: Any, settings: Settings) -> None:
             if sign_in_button.is_enabled():
                 print("Cloudflare verification completed; resubmitting sign-in once.")
                 try:
-                    sign_in_button.click(timeout=5_000)
+                    sign_in_button.click(timeout=remaining_timeout_ms(5_000))
                 except Exception:
                     pass
                 else:
@@ -878,7 +1125,7 @@ def login(page: Any, settings: Settings) -> None:
                     last_submission_at = time.monotonic()
                     form_was_hidden = False
 
-        page.wait_for_timeout(500)
+        page.wait_for_timeout(LOGIN_POLL_INTERVAL_MS)
 
     mode_hint = (
         "Rerun without --headless so you can complete browser verification."
@@ -952,53 +1199,137 @@ async def crawl(
     return submission_files, updated_count, max(watermark, download_watermark)
 
 
-async def run_check(client: LeetCodeClient) -> None:
+async def run_check(
+    client: LeetCodeClient, limit: int, concurrent_downloads: int
+) -> None:
     solved_questions = await fetch_solved_questions(client)
     if not solved_questions:
         print("Authenticated API check succeeded; this account has no solved problems.")
         return
-    latest_question = max(
-        solved_questions, key=lambda question: question.last_submitted_at or 0
-    )
-    submission = await fetch_latest_accepted_submission(
-        client, latest_question.title_slug
-    )
-    code, _ = await fetch_submission_code(client, submission.submission_id)
-    if not code:
-        raise CrawlerError("LeetCode returned an empty solution during the API check")
+
+    check_questions = sorted(
+        solved_questions,
+        key=lambda question: question.last_submitted_at or 0,
+        reverse=True,
+    )[:limit]
+    semaphore = asyncio.Semaphore(concurrent_downloads)
+    progress_lock = asyncio.Lock()
+    completed_count = 0
+
+    async def validate(question: SolvedQuestion) -> None:
+        nonlocal completed_count
+        async with semaphore:
+            submission = await fetch_latest_accepted_submission(
+                client, question.title_slug
+            )
+            code, _ = await fetch_submission_code(client, submission.submission_id)
+            if not code:
+                raise CrawlerError(
+                    f"LeetCode returned an empty solution for {question.title_slug!r} "
+                    "during the API check"
+                )
+
+        async with progress_lock:
+            completed_count += 1
+            print(
+                f"[{completed_count}/{len(check_questions)}] Verified "
+                f"{question.frontend_id}. {question.title}"
+            )
+
+    await asyncio.gather(*(validate(question) for question in check_questions))
+    noun = "submission" if len(check_questions) == 1 else "submissions"
     print(
         "Authenticated API check succeeded: "
-        f"{len(solved_questions)} solved problems found and solution download verified."
+        f"{len(solved_questions)} solved problems found and "
+        f"{len(check_questions)} {noun} downloaded."
     )
 
 
-async def run_authenticated(
-    session_cookie: str,
-    settings: Settings,
-    checkpoint: int,
-    check_only: bool,
-) -> tuple[list[Path], int, int] | None:
-    from curl_cffi.requests import AsyncSession
-
+def authenticated_session_options(settings: Settings) -> dict[str, Any]:
     headers = {
         "Accept": "application/json",
         "Content-Type": "application/json",
         "Origin": LEETCODE_URL,
         "Referer": f"{LEETCODE_URL}/",
     }
-    async with AsyncSession(
+    proxy = settings.proxy
+    return dict(
         headers=headers,
         impersonate="chrome",
         max_clients=settings.concurrent_downloads,
         timeout=30,
-    ) as session:
+        proxy=proxy.server if proxy else None,
+        proxy_auth=(proxy.username, proxy.password)
+        if proxy and proxy.username
+        else None,
+    )
+
+
+async def validate_authenticated_api(
+    session_cookie: str, settings: Settings
+) -> None:
+    from curl_cffi.requests import AsyncSession
+
+    async with AsyncSession(**authenticated_session_options(settings)) as session:
         client = LeetCodeClient(
             session,
             session_cookie,
             settings.request_delay_seconds,
         )
-        if check_only:
-            await run_check(client)
+        data = await client.graphql_request(
+            "userProgressQuestionList",
+            USER_PROGRESS_QUERY,
+            {
+                "filters": {
+                    "questionStatus": "SOLVED",
+                    "skip": 0,
+                    "limit": 1,
+                }
+            },
+        )
+        container = data.get("userProgressQuestionList")
+        if not isinstance(container, Mapping) or not isinstance(
+            container.get("questions"), list
+        ):
+            raise CrawlerError(
+                "LeetCode did not return the signed-in user's solved questions"
+            )
+
+
+def validate_authenticated_api_sync(
+    session_cookie: str, settings: Settings
+) -> None:
+    failures: list[BaseException] = []
+
+    def run_validation() -> None:
+        try:
+            asyncio.run(validate_authenticated_api(session_cookie, settings))
+        except BaseException as exc:
+            failures.append(exc)
+
+    thread = threading.Thread(target=run_validation)
+    thread.start()
+    thread.join()
+    if failures:
+        raise failures[0]
+
+
+async def run_authenticated(
+    session_cookie: str,
+    settings: Settings,
+    checkpoint: int,
+    check_limit: int | None,
+) -> tuple[list[Path], int, int] | None:
+    from curl_cffi.requests import AsyncSession
+
+    async with AsyncSession(**authenticated_session_options(settings)) as session:
+        client = LeetCodeClient(
+            session,
+            session_cookie,
+            settings.request_delay_seconds,
+        )
+        if check_limit is not None:
+            await run_check(client, check_limit, settings.concurrent_downloads)
             return None
         return await crawl(client, settings, checkpoint)
 
@@ -1012,6 +1343,14 @@ def launch_browser_context(playwright: Any, settings: Settings) -> Any:
     }
     if settings.browser_channel:
         options["channel"] = settings.browser_channel
+    if settings.proxy:
+        proxy: dict[str, str] = {"server": settings.proxy.server}
+        if settings.proxy.username:
+            proxy.update(
+                username=settings.proxy.username,
+                password=settings.proxy.password,
+            )
+        options["proxy"] = proxy
     try:
         return playwright.chromium.launch_persistent_context(**options)
     except Exception as first_error:
@@ -1030,6 +1369,146 @@ def launch_browser_context(playwright: Any, settings: Settings) -> Any:
             raise CrawlerError(
                 f"Could not launch Patchright Chromium: {second_error}"
             ) from second_error
+
+
+def settings_for_proxy(
+    settings: Settings, proxy: ProxySettings | None
+) -> Settings:
+    if proxy is None:
+        return replace(settings, proxy=None)
+
+    profile_key = hashlib.sha256(
+        f"{settings.username}\0{proxy.server}\0{proxy.username}".encode("utf-8")
+    ).hexdigest()[:16]
+    return replace(
+        settings,
+        proxy=proxy,
+        browser_profile_path=settings.browser_profile_path / f"proxy-{profile_key}",
+    )
+
+
+def safe_login_failure(exc: Exception) -> str:
+    message = str(exc).strip()
+    lowered = message.lower()
+    safe_prefixes = (
+        "the leetcode login form did not load",
+        "leetcode kept the sign in button disabled",
+        "leetcode login timed out",
+        "manual leetcode login timed out",
+    )
+    if lowered.startswith(safe_prefixes):
+        return message
+    if any(
+        token in lowered
+        for token in (
+            "proxy",
+            "tunnel",
+            "net::err",
+            "err_socks",
+            "err_connection",
+            "response_code",
+        )
+    ):
+        return "the proxy or browser connection failed"
+    return "the browser login attempt failed"
+
+
+def authenticate_candidate(playwright: Any, settings: Settings) -> str:
+    from patchright.sync_api import Error as BrowserError
+
+    context = launch_browser_context(playwright, settings)
+    try:
+        page = context.pages[0] if context.pages else context.new_page()
+        page.set_default_timeout(30_000)
+        try:
+            login(page, settings)
+            return extract_leetcode_session(context.cookies([LEETCODE_URL]))
+        except BrowserError as exc:
+            detail = str(exc).strip().lower()
+            if "target page, context or browser has been closed" in detail:
+                message = "The Chrome window was closed before the crawler finished."
+            else:
+                message = "Browser operation failed during LeetCode login."
+            raise CrawlerError(message) from exc
+    finally:
+        try:
+            context.close()
+        except Exception:
+            pass
+
+
+def authenticate_with_proxies(
+    playwright: Any,
+    settings: Settings,
+    validate_candidate: Callable[[str, Settings], None] | None = None,
+) -> tuple[str, Settings]:
+    candidates: tuple[ProxySettings | None, ...] = (
+        settings.proxy_candidates if settings.proxy_candidates else (None,)
+    )
+    rounds = (
+        PROXY_LOGIN_ROUNDS
+        if settings.proxy_candidates and not settings.manual_login
+        else 1
+    )
+    rejected_profiles: set[Path] = set()
+
+    for round_number in range(1, rounds + 1):
+        for candidate_number, proxy in enumerate(candidates, start=1):
+            candidate_settings = settings_for_proxy(settings, proxy)
+            if candidate_settings.browser_profile_path in rejected_profiles:
+                candidate_settings = replace(
+                    candidate_settings, force_session_refresh=True
+                )
+            if settings.proxy_candidates:
+                print(
+                    f"Login round {round_number}/{rounds}, "
+                    f"proxy {candidate_number}/{len(candidates)}."
+                )
+            try:
+                session_cookie = authenticate_candidate(
+                    playwright, candidate_settings
+                )
+            except CredentialError:
+                raise
+            except CrawlerError as exc:
+                if not settings.proxy_candidates:
+                    raise
+                print(
+                    f"Login round {round_number}/{rounds}, proxy "
+                    f"{candidate_number}/{len(candidates)} failed: "
+                    f"{safe_login_failure(exc)}",
+                    file=sys.stderr,
+                )
+                continue
+
+            if validate_candidate is not None:
+                try:
+                    validate_candidate(session_cookie, candidate_settings)
+                except CrawlerError:
+                    if not settings.proxy_candidates:
+                        raise
+                    rejected_profiles.add(
+                        candidate_settings.browser_profile_path
+                    )
+                    print(
+                        f"Login round {round_number}/{rounds}, proxy "
+                        f"{candidate_number}/{len(candidates)} failed: "
+                        "the authenticated API check failed",
+                        file=sys.stderr,
+                    )
+                    continue
+
+            if settings.proxy_candidates:
+                print(
+                    f"Authenticated with proxy {candidate_number}/"
+                    f"{len(candidates)} in round {round_number}/{rounds}."
+                )
+            return session_cookie, candidate_settings
+
+    raise CrawlerError(
+        "LeetCode login failed after "
+        f"{rounds} rounds across {len(candidates)} proxy candidates"
+    )
 
 
 def finalize_download(
@@ -1069,31 +1548,17 @@ def execute(args: argparse.Namespace) -> None:
     settings = resolve_settings(args, config)
     checkpoint = get_last_update(config)
 
-    from patchright.sync_api import Error as BrowserError
     from patchright.sync_api import sync_playwright
 
     # Patchright removes Playwright's CDP and command-line fingerprint leaks.
     # The persistent Chrome profile is used only to create or refresh the human
     # session. Bulk requests receive only its LEETCODE_SESSION cookie.
     with sync_playwright() as playwright:
-        context = launch_browser_context(playwright, settings)
-        try:
-            page = context.pages[0] if context.pages else context.new_page()
-            page.set_default_timeout(30_000)
-            try:
-                login(page, settings)
-                session_cookie = extract_leetcode_session(
-                    context.cookies([LEETCODE_URL])
-                )
-            except BrowserError as exc:
-                detail = str(exc).strip() or type(exc).__name__
-                if "target page, context or browser has been closed" in detail.lower():
-                    detail = "The Chrome window was closed before the crawler finished."
-                else:
-                    detail = f"Browser operation failed: {detail}"
-                raise CrawlerError(detail) from exc
-        finally:
-            context.close()
+        session_cookie, settings = authenticate_with_proxies(
+            playwright,
+            settings,
+            validate_authenticated_api_sync,
+        )
 
     result = asyncio.run(
         run_authenticated(session_cookie, settings, checkpoint, args.check)
@@ -1159,6 +1624,12 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--login-timeout-seconds",
+        type=int,
+        default=None,
+        help="override the maximum time to wait for LeetCode login (minimum: 10)",
+    )
+    parser.add_argument(
         "--non-interactive",
         action="store_true",
         help="fail instead of prompting for missing credentials",
@@ -1173,10 +1644,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--check",
-        action="store_true",
+        nargs="?",
+        type=int,
+        const=1,
+        metavar="COUNT",
         help=(
-            "verify login and API access without writing files, Git commits, "
-            "or checkpoints"
+            "verify login and API access for up to COUNT latest accepted "
+            "submissions without writing files, Git commits, or checkpoints "
+            "(default: 1)"
         ),
     )
     return parser
@@ -1185,6 +1660,8 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    if args.check is not None and args.check < 1:
+        parser.error("--check COUNT must be at least 1")
     try:
         execute(args)
     except (CrawlerError, GitOperationError, KeyboardInterrupt) as exc:
