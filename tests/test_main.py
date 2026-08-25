@@ -600,6 +600,100 @@ def test_login_polls_and_clicks_cloudflare_before_form_appears(mocker):
     page.goto.assert_any_call(main.LEETCODE_URL, wait_until="domcontentloaded")
 
 
+def test_login_refreshes_form_deadline_after_cloudflare_click(mocker):
+    page = mocker.MagicMock()
+    page.url = main.LOGIN_URL
+    clock = [0.0]
+    mocker.patch.object(main.time, "monotonic", side_effect=lambda: clock[0])
+    challenge_click = mocker.patch.object(
+        main,
+        "maybe_click_cloudflare",
+        side_effect=lambda _page: clock[0] >= 8,
+    )
+
+    username = mocker.MagicMock()
+    username.is_visible.side_effect = lambda: clock[0] >= 12
+    password = mocker.MagicMock()
+    button = mocker.MagicMock()
+    page.locator.side_effect = {
+        "#id_login": username,
+        "#id_password": password,
+        "#signin_btn": button,
+    }.__getitem__
+    page.wait_for_timeout.side_effect = lambda milliseconds: clock.__setitem__(
+        0, clock[0] + milliseconds / 1_000
+    )
+    page.context.cookies.side_effect = [
+        [],
+        [{"name": "LEETCODE_SESSION", "value": "session"}],
+    ]
+    settings = main.Settings(
+        config_path=Path("config.ini"),
+        submissions_path=Path("submissions"),
+        browser_profile_path=Path(".browser-profile"),
+        username="user",
+        password="password",
+        headless=False,
+        push=False,
+        browser_channel="chrome",
+        login_timeout_seconds=10,
+        request_delay_seconds=0,
+        manual_login=False,
+    )
+
+    main.login(page, settings)
+
+    assert clock[0] == 12
+    assert challenge_click.call_count == 6
+    username.fill.assert_called_once_with("user")
+    password.fill.assert_called_once_with("password")
+
+
+def test_login_rechecks_form_when_it_appears_at_deadline(mocker):
+    page = mocker.MagicMock()
+    page.url = main.LOGIN_URL
+    clock = [0.0]
+    mocker.patch.object(main.time, "monotonic", side_effect=lambda: clock[0])
+    mocker.patch.object(main, "maybe_click_cloudflare", return_value=False)
+
+    username = mocker.MagicMock()
+    username.is_visible.side_effect = lambda: clock[0] >= 1
+    password = mocker.MagicMock()
+    button = mocker.MagicMock()
+    page.locator.side_effect = {
+        "#id_login": username,
+        "#id_password": password,
+        "#signin_btn": button,
+    }.__getitem__
+    page.wait_for_timeout.side_effect = lambda milliseconds: clock.__setitem__(
+        0, clock[0] + milliseconds / 1_000
+    )
+    page.context.cookies.side_effect = [
+        [],
+        [{"name": "LEETCODE_SESSION", "value": "session"}],
+    ]
+    settings = main.Settings(
+        config_path=Path("config.ini"),
+        submissions_path=Path("submissions"),
+        browser_profile_path=Path(".browser-profile"),
+        username="user",
+        password="password",
+        headless=False,
+        push=False,
+        browser_channel="chrome",
+        login_timeout_seconds=1,
+        request_delay_seconds=0,
+        manual_login=False,
+    )
+
+    main.login(page, settings)
+
+    assert clock[0] == 1
+    assert username.is_visible.call_count == 3
+    username.fill.assert_called_once_with("user")
+    password.fill.assert_called_once_with("password")
+
+
 def test_login_waits_for_cloudflare_to_enable_sign_in(mocker):
     page = mocker.MagicMock()
     page.url = main.LOGIN_URL

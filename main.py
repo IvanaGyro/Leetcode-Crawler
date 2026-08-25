@@ -958,6 +958,7 @@ def login(page: Any, settings: Settings) -> None:
 
     print("Waiting for LeetCode. Complete any Cloudflare verification shown.")
     form_is_visible = False
+    form_deadline_refreshed = False
     while time.monotonic() < deadline:
         try:
             form_is_visible = username_field.is_visible()
@@ -965,8 +966,23 @@ def login(page: Any, settings: Settings) -> None:
             form_is_visible = False
         if form_is_visible:
             break
-        attempt_cloudflare_click()
-        page.wait_for_timeout(LOGIN_POLL_INTERVAL_MS)
+        challenge_was_clicked = attempt_cloudflare_click()
+        if challenge_was_clicked and not form_deadline_refreshed:
+            # Give the page one complete loading window after interacting with
+            # a pre-form challenge, without allowing repeated clicks to wait
+            # forever.
+            deadline = time.monotonic() + settings.login_timeout_seconds
+            form_deadline_refreshed = True
+        page.wait_for_timeout(
+            min(LOGIN_POLL_INTERVAL_MS, remaining_timeout_ms())
+        )
+    if not form_is_visible:
+        # The form can appear during the last poll sleep exactly as the
+        # deadline expires. Check once more before reporting a timeout.
+        try:
+            form_is_visible = username_field.is_visible()
+        except Exception:
+            form_is_visible = False
     if not form_is_visible:
         raise CrawlerError(
             "The LeetCode login form did not load after Cloudflare verification."
