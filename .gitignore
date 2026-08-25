@@ -4,6 +4,8 @@ config.ini
 .venv/
 .pixi/
 .browser-profile/
+.browser_profile/
+proxy_list.env
 __pycache__/
 *.py[cod]
 .pytest_cache/
