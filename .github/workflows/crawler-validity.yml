@@ -18,7 +18,7 @@ concurrency:
 
 jobs:
   live-check:
-    runs-on: windows-2025
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
 
     steps:
@@ -34,7 +34,7 @@ jobs:
         if: github.event_name == 'pull_request'
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
-        run: git merge-base --is-ancestor "$env:BASE_SHA" HEAD
+        run: git merge-base --is-ancestor "$BASE_SHA" HEAD
 
       - name: Set up Pixi
         uses: prefix-dev/setup-pixi@v0.10.0
@@ -43,8 +43,41 @@ jobs:
           cache: true
           cache-write: ${{ github.event_name == 'schedule' }}
 
+      - name: Restore Patchright Chromium
+        id: browser-cache
+        uses: actions/cache/restore@v6
+        with:
+          path: ~/.cache/ms-playwright
+          key: >-
+            patchright-chromium-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('pyproject.toml') }}
+
+      - name: Install Patchright Chromium
+        if: steps.browser-cache.outputs.cache-hit != 'true'
+        run: pixi run install-browser
+
+      - name: Save Patchright Chromium
+        if: steps.browser-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: ~/.cache/ms-playwright
+          key: ${{ steps.browser-cache.outputs.cache-primary-key }}
+
       - name: Run unit tests
         run: pixi run test
+
+      # Changing the LeetCode account or proxy list starts with a fresh profile
+      # archive instead of carrying obsolete proxy directories forward.
+      - name: Identify login-state cache scope
+        id: login-scope
+        env:
+          LEETCODE_USERNAME: ${{ secrets.LEETCODE_USERNAME }}
+          LEETCODE_PROXY_LIST: ${{ secrets.LEETCODE_PROXY_LIST }}
+        run: |
+          set -euo pipefail
+          scope="$(printf '%s\0%s' "$LEETCODE_USERNAME" "$LEETCODE_PROXY_LIST" \
+            | sha256sum | cut -d ' ' -f 1)"
+          echo "::add-mask::$scope"
+          echo "value=$scope" >> "$GITHUB_OUTPUT"
 
       - name: Restore encrypted login state
         id: login-cache
@@ -52,32 +85,31 @@ jobs:
         with:
           path: ${{ runner.temp }}/leetcode-login-state.tar.gz.enc
           key: >-
-            leetcode-login-state-v1-${{ runner.os }}-${{ github.run_id }}-${{ github.run_attempt }}
+            leetcode-login-state-v2-${{ runner.os }}-${{ steps.login-scope.outputs.value }}-${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: |
-            leetcode-login-state-v1-${{ runner.os }}-
+            leetcode-login-state-v2-${{ runner.os }}-${{ steps.login-scope.outputs.value }}-
 
       - name: Decrypt cached login state
         if: steps.login-cache.outputs.cache-matched-key != ''
         env:
           LEETCODE_CACHE_PASSWORD: ${{ secrets.LEETCODE_PASSWORD }}
         run: |
-          $ErrorActionPreference = "Stop"
-          $encrypted = Join-Path $env:RUNNER_TEMP "leetcode-login-state.tar.gz.enc"
-          $archive = Join-Path $env:RUNNER_TEMP "leetcode-login-state.tar.gz"
-          & openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 `
-            -in $encrypted -out $archive `
-            -pass env:LEETCODE_CACHE_PASSWORD 2>$null
-          if ($LASTEXITCODE -ne 0) {
-            Write-Output "::warning::Cached login state could not be decrypted; logging in again."
-            Remove-Item -LiteralPath $encrypted, $archive `
-              -Force -ErrorAction SilentlyContinue
+          set -euo pipefail
+          encrypted="${RUNNER_TEMP}/leetcode-login-state.tar.gz.enc"
+          archive="${RUNNER_TEMP}/leetcode-login-state.tar.gz"
+          if ! openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 \
+            -in "$encrypted" -out "$archive" \
+            -pass env:LEETCODE_CACHE_PASSWORD 2>/dev/null; then
+            echo "::warning::Cached login state could not be decrypted; logging in again."
+            rm -f "$encrypted" "$archive"
             exit 0
-          }
-          & tar -xzf $archive -C $env:RUNNER_TEMP
-          if ($LASTEXITCODE -ne 0) {
-            throw "Cached login state could not be extracted."
-          }
-          Remove-Item -LiteralPath $encrypted, $archive -Force
+          fi
+          if ! tar -xzf "$archive" -C "$RUNNER_TEMP"; then
+            echo "::warning::Cached login state could not be extracted; logging in again."
+            rm -f "$encrypted" "$archive"
+            exit 0
+          fi
+          rm -f "$encrypted" "$archive"
 
       - name: Check 50 live submissions
         id: live-check
@@ -86,9 +118,10 @@ jobs:
           LEETCODE_PASSWORD: ${{ secrets.LEETCODE_PASSWORD }}
           LEETCODE_PROXY_LIST: ${{ secrets.LEETCODE_PROXY_LIST }}
         run: >-
+          xvfb-run --auto-servernum
           pixi run crawl
           --headed
-          --browser-channel=
+          --browser-channel ""
           --browser-profile "${{ runner.temp }}/leetcode-browser-profile"
           --login-timeout-seconds 20
           --non-interactive
@@ -103,37 +136,29 @@ jobs:
         env:
           LEETCODE_CACHE_PASSWORD: ${{ secrets.LEETCODE_PASSWORD }}
         run: |
-          $ErrorActionPreference = "Stop"
-          $profile = Join-Path $env:RUNNER_TEMP "leetcode-browser-profile"
-          $archive = Join-Path $env:RUNNER_TEMP "leetcode-login-state.tar.gz"
-          $encrypted = Join-Path $env:RUNNER_TEMP "leetcode-login-state.tar.gz.enc"
-          if (-not (Test-Path -LiteralPath $profile -PathType Container)) {
-            Write-Output "::warning::No browser profile was created; skipping login-state cache."
-            "ready=false" | Out-File -FilePath $env:GITHUB_OUTPUT `
-              -Encoding utf8 -Append
+          set -euo pipefail
+          profile="${RUNNER_TEMP}/leetcode-browser-profile"
+          archive="${RUNNER_TEMP}/leetcode-login-state.tar.gz"
+          encrypted="${RUNNER_TEMP}/leetcode-login-state.tar.gz.enc"
+          if [[ ! -d "$profile" ]]; then
+            echo "::warning::No browser profile was created; skipping login-state cache."
+            echo "ready=false" >> "$GITHUB_OUTPUT"
             exit 0
-          }
-          # Chromium may briefly retain Windows file locks on volatile GPU
-          # caches. They are not login state and do not need to be restored.
-          & tar -czf $archive `
-            --exclude="*/ShaderCache/*" `
-            --exclude="*/GrShaderCache/*" `
-            --exclude="*/GPUCache/*" `
-            --exclude="*/DawnGraphiteCache/*" `
-            --exclude="*/DawnWebGPUCache/*" `
-            -C $env:RUNNER_TEMP leetcode-browser-profile
-          if ($LASTEXITCODE -ne 0) {
-            throw "Browser profile could not be archived."
-          }
-          & openssl enc -aes-256-cbc -salt -pbkdf2 -iter 200000 `
-            -in $archive -out $encrypted `
+          fi
+          # Volatile Chromium GPU caches are not login state and do not need
+          # to be restored.
+          tar -czf "$archive" \
+            --exclude="*/ShaderCache/*" \
+            --exclude="*/GrShaderCache/*" \
+            --exclude="*/GPUCache/*" \
+            --exclude="*/DawnGraphiteCache/*" \
+            --exclude="*/DawnWebGPUCache/*" \
+            -C "$RUNNER_TEMP" leetcode-browser-profile
+          openssl enc -aes-256-cbc -salt -pbkdf2 -iter 200000 \
+            -in "$archive" -out "$encrypted" \
             -pass env:LEETCODE_CACHE_PASSWORD
-          if ($LASTEXITCODE -ne 0) {
-            throw "Browser profile could not be encrypted."
-          }
-          Remove-Item -LiteralPath $archive -Force
-          "ready=true" | Out-File -FilePath $env:GITHUB_OUTPUT `
-            -Encoding utf8 -Append
+          rm -f "$archive"
+          echo "ready=true" >> "$GITHUB_OUTPUT"
 
       - name: Save encrypted login state
         if: always() && steps.prepare-login-cache.outputs.ready == 'true'
@@ -141,4 +166,4 @@ jobs:
         with:
           path: ${{ runner.temp }}/leetcode-login-state.tar.gz.enc
           key: >-
-            leetcode-login-state-v1-${{ runner.os }}-${{ github.run_id }}-${{ github.run_attempt }}
+            leetcode-login-state-v2-${{ runner.os }}-${{ steps.login-scope.outputs.value }}-${{ github.run_id }}-${{ github.run_attempt }}

@@ -113,13 +113,16 @@ pixi run test
 The `Crawler validity` GitHub Actions workflow runs every four hours and for
 pull requests targeting `main`. Pull requests are tested from GitHub's merge
 ref, so the checked revision includes the current target-branch commit. A pinned
-Windows Server 2025 runner launches headed Chromium without Xvfb. The live check
-downloads up to 50 recent submissions without writing solutions, committing, or
-pushing. Configure `LEETCODE_USERNAME`, `LEETCODE_PASSWORD`, and the multiline
-`LEETCODE_PROXY_LIST` as repository Actions secrets for this job.
+Ubuntu runner launches headed Chromium under Xvfb. The live check downloads up
+to 50 recent submissions without writing solutions, committing, or pushing.
+Configure `LEETCODE_USERNAME`, `LEETCODE_PASSWORD`, and the multiline
+`LEETCODE_PROXY_LIST` as repository Actions secrets for this job. Patchright's
+downloaded Chromium is cached by operating system, architecture, and the pinned
+project dependencies.
 
 Runs that create per-proxy browser profiles cache them so later checks can reuse
 the authenticated session or continue the browser verification state. The
 profile archive is encrypted with `LEETCODE_PASSWORD` before it is saved to
 GitHub Actions cache; plaintext login state is never placed in Git or in the
-cache.
+cache. Changing the LeetCode account or proxy list starts a separate cache scope
+so obsolete proxy profiles are not republished.
