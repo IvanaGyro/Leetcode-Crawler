@@ -500,6 +500,77 @@ def test_proxy_rotation_validates_api_before_accepting_candidate(mocker):
     ]
 
 
+def test_rejected_session_is_cleared_before_profile_retry(mocker):
+    proxy = main.ProxySettings(
+        "http://proxy.example:80", "proxy-user", "proxy-password"
+    )
+    settings = main.Settings(
+        config_path=Path("config.ini"),
+        submissions_path=Path("submissions"),
+        browser_profile_path=Path(".browser-profile"),
+        username="user",
+        password="password",
+        headless=False,
+        push=False,
+        browser_channel=None,
+        login_timeout_seconds=15,
+        request_delay_seconds=0,
+        manual_login=False,
+        proxy_candidates=(proxy,),
+    )
+    authenticate = mocker.patch.object(
+        main,
+        "authenticate_candidate",
+        side_effect=["stale-cookie", "fresh-cookie"],
+    )
+    validate = mocker.Mock(
+        side_effect=[main.CrawlerError("session rejected"), None]
+    )
+
+    session_cookie, selected = main.authenticate_with_proxies(
+        mocker.MagicMock(), settings, validate
+    )
+
+    assert session_cookie == "fresh-cookie"
+    first_attempt = authenticate.call_args_list[0].args[1]
+    second_attempt = authenticate.call_args_list[1].args[1]
+    assert not first_attempt.force_session_refresh
+    assert second_attempt.force_session_refresh
+    assert first_attempt.browser_profile_path == second_attempt.browser_profile_path
+    assert selected.force_session_refresh
+
+
+def test_forced_session_refresh_clears_cookie_before_login(mocker):
+    page = mocker.MagicMock()
+    page.context.cookies.return_value = [
+        {"name": "LEETCODE_SESSION", "value": "fresh-session"}
+    ]
+    settings = main.Settings(
+        config_path=Path("config.ini"),
+        submissions_path=Path("submissions"),
+        browser_profile_path=Path(".browser-profile"),
+        username="",
+        password="",
+        headless=False,
+        push=False,
+        browser_channel=None,
+        login_timeout_seconds=15,
+        request_delay_seconds=0,
+        manual_login=True,
+        force_session_refresh=True,
+    )
+
+    main.login(page, settings)
+
+    page.context.clear_cookies.assert_called_once_with(
+        name=main.LEETCODE_SESSION_COOKIE
+    )
+    assert page.goto.call_args_list == [
+        mocker.call(main.LOGIN_URL, wait_until="domcontentloaded"),
+        mocker.call(main.LEETCODE_URL, wait_until="domcontentloaded"),
+    ]
+
+
 def test_sync_api_validation_works_while_an_event_loop_is_running(mocker):
     settings = mocker.MagicMock(spec=main.Settings)
     validate = mocker.patch.object(

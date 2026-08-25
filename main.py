@@ -205,6 +205,7 @@ class Settings:
     concurrent_downloads: int = DEFAULT_CONCURRENT_DOWNLOADS
     proxy: ProxySettings | None = None
     proxy_candidates: tuple[ProxySettings, ...] = ()
+    force_session_refresh: bool = False
 
 
 def load_config(path: Path) -> configparser.ConfigParser:
@@ -922,7 +923,14 @@ def maybe_click_cloudflare(page: Any) -> bool:
 
 
 def login(page: Any, settings: Settings) -> None:
-    if has_leetcode_session(page.context.cookies([LEETCODE_URL])):
+    if settings.force_session_refresh:
+        try:
+            page.context.clear_cookies(name=LEETCODE_SESSION_COOKIE)
+        except Exception as exc:
+            raise CrawlerError(
+                "Could not clear the rejected LeetCode session before retrying."
+            ) from exc
+    elif has_leetcode_session(page.context.cookies([LEETCODE_URL])):
         page.goto(LEETCODE_URL, wait_until="domcontentloaded")
         return
 
@@ -1442,10 +1450,15 @@ def authenticate_with_proxies(
         if settings.proxy_candidates and not settings.manual_login
         else 1
     )
+    rejected_profiles: set[Path] = set()
 
     for round_number in range(1, rounds + 1):
         for candidate_number, proxy in enumerate(candidates, start=1):
             candidate_settings = settings_for_proxy(settings, proxy)
+            if candidate_settings.browser_profile_path in rejected_profiles:
+                candidate_settings = replace(
+                    candidate_settings, force_session_refresh=True
+                )
             if settings.proxy_candidates:
                 print(
                     f"Login round {round_number}/{rounds}, "
@@ -1474,6 +1487,9 @@ def authenticate_with_proxies(
                 except CrawlerError:
                     if not settings.proxy_candidates:
                         raise
+                    rejected_profiles.add(
+                        candidate_settings.browser_profile_path
+                    )
                     print(
                         f"Login round {round_number}/{rounds}, proxy "
                         f"{candidate_number}/{len(candidates)} failed: "
