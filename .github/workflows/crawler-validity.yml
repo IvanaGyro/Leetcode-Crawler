@@ -97,6 +97,8 @@ jobs:
           set -euo pipefail
           encrypted="${RUNNER_TEMP}/leetcode-login-state.tar.gz.enc"
           archive="${RUNNER_TEMP}/leetcode-login-state.tar.gz"
+          extract_dir="${RUNNER_TEMP}/leetcode-login-state-extract"
+          profile="${RUNNER_TEMP}/leetcode-browser-profile"
           if ! openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 \
             -in "$encrypted" -out "$archive" \
             -pass env:LEETCODE_CACHE_PASSWORD 2>/dev/null; then
@@ -104,11 +106,24 @@ jobs:
             rm -f "$encrypted" "$archive"
             exit 0
           fi
-          if ! tar -xzf "$archive" -C "$RUNNER_TEMP"; then
+          rm -rf -- "$extract_dir"
+          mkdir -p "$extract_dir"
+          if ! tar -xzf "$archive" -C "$extract_dir"; then
             echo "::warning::Cached login state could not be extracted; logging in again."
             rm -f "$encrypted" "$archive"
+            rm -rf -- "$extract_dir"
             exit 0
           fi
+          extracted_profile="${extract_dir}/leetcode-browser-profile"
+          if [[ ! -d "$extracted_profile" ]]; then
+            echo "::warning::Cached login state did not contain a browser profile; logging in again."
+            rm -f "$encrypted" "$archive"
+            rm -rf -- "$extract_dir"
+            exit 0
+          fi
+          rm -rf -- "$profile"
+          mv "$extracted_profile" "$profile"
+          rmdir "$extract_dir"
           rm -f "$encrypted" "$archive"
 
       - name: Check 50 live submissions
