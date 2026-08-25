@@ -290,6 +290,21 @@ def test_proxy_list_rejects_an_invalid_entry_without_echoing_it(monkeypatch):
         raise AssertionError("invalid proxy list entry was accepted")
 
 
+def test_proxy_list_rejects_userinfo_in_the_host(monkeypatch):
+    monkeypatch.setenv(
+        "LEETCODE_PROXY_LIST",
+        "trusted.example@other.example:3128:proxy-user:proxy-password",
+    )
+
+    try:
+        main.resolve_proxy_settings()
+    except main.CrawlerError as exc:
+        assert "entry 1" in str(exc)
+        assert "other.example" not in str(exc)
+    else:
+        raise AssertionError("proxy host userinfo was accepted")
+
+
 def test_manual_login_does_not_read_configured_credentials(monkeypatch):
     config = main.load_config(Path("does-not-exist.ini"))
     config.set(main.SECTION_USER, main.USER_USERNAME, "configured-user")
@@ -413,6 +428,141 @@ def test_proxy_login_retries_the_whole_list_for_two_rounds(mocker):
     ]
     assert attempted_settings[0].browser_profile_path == attempted_settings[2].browser_profile_path
     assert attempted_settings[0].browser_profile_path != attempted_settings[1].browser_profile_path
+
+
+def test_proxy_profiles_are_isolated_by_leetcode_account():
+    proxy = main.ProxySettings(
+        "http://proxy.example:80", "proxy-user", "proxy-password"
+    )
+    first_account = main.Settings(
+        config_path=Path("config.ini"),
+        submissions_path=Path("submissions"),
+        browser_profile_path=Path(".browser-profile"),
+        username="first-account",
+        password="password",
+        headless=False,
+        push=False,
+        browser_channel=None,
+        login_timeout_seconds=15,
+        request_delay_seconds=0,
+        manual_login=False,
+    )
+    second_account = main.replace(first_account, username="second-account")
+
+    first_profile = main.settings_for_proxy(
+        first_account, proxy
+    ).browser_profile_path
+    second_profile = main.settings_for_proxy(
+        second_account, proxy
+    ).browser_profile_path
+
+    assert first_profile != second_profile
+
+
+def test_proxy_rotation_validates_api_before_accepting_candidate(mocker):
+    proxies = (
+        main.ProxySettings("http://proxy-one.example:80", "user-one", "password"),
+        main.ProxySettings("http://proxy-two.example:80", "user-two", "password"),
+    )
+    settings = main.Settings(
+        config_path=Path("config.ini"),
+        submissions_path=Path("submissions"),
+        browser_profile_path=Path(".browser-profile"),
+        username="user",
+        password="password",
+        headless=False,
+        push=False,
+        browser_channel=None,
+        login_timeout_seconds=15,
+        request_delay_seconds=0,
+        manual_login=False,
+        proxy_candidates=proxies,
+    )
+    authenticate = mocker.patch.object(
+        main,
+        "authenticate_candidate",
+        side_effect=["first-cookie", "second-cookie"],
+    )
+    validate = mocker.Mock(
+        side_effect=[main.CrawlerError("API connection failed"), None]
+    )
+
+    session_cookie, selected = main.authenticate_with_proxies(
+        mocker.MagicMock(), settings, validate
+    )
+
+    assert session_cookie == "second-cookie"
+    assert selected.proxy == proxies[1]
+    assert authenticate.call_count == 2
+    assert [call.args[0] for call in validate.call_args_list] == [
+        "first-cookie",
+        "second-cookie",
+    ]
+
+
+def test_proxy_rotation_stops_on_credential_failure(mocker):
+    proxies = (
+        main.ProxySettings("http://proxy-one.example:80", "user-one", "password"),
+        main.ProxySettings("http://proxy-two.example:80", "user-two", "password"),
+    )
+    settings = main.Settings(
+        config_path=Path("config.ini"),
+        submissions_path=Path("submissions"),
+        browser_profile_path=Path(".browser-profile"),
+        username="user",
+        password="bad-password",
+        headless=False,
+        push=False,
+        browser_channel=None,
+        login_timeout_seconds=15,
+        request_delay_seconds=0,
+        manual_login=False,
+        proxy_candidates=proxies,
+    )
+    authenticate = mocker.patch.object(
+        main,
+        "authenticate_candidate",
+        side_effect=main.CredentialError("incorrect username or password"),
+    )
+
+    try:
+        main.authenticate_with_proxies(mocker.MagicMock(), settings)
+    except main.CredentialError as exc:
+        assert "incorrect username or password" in str(exc)
+    else:
+        raise AssertionError("credential failure did not stop proxy rotation")
+
+    authenticate.assert_called_once()
+
+
+def test_direct_login_preserves_the_original_failure(mocker):
+    settings = main.Settings(
+        config_path=Path("config.ini"),
+        submissions_path=Path("submissions"),
+        browser_profile_path=Path(".browser-profile"),
+        username="user",
+        password="password",
+        headless=False,
+        push=False,
+        browser_channel=None,
+        login_timeout_seconds=15,
+        request_delay_seconds=0,
+        manual_login=False,
+    )
+    authenticate = mocker.patch.object(
+        main,
+        "authenticate_candidate",
+        side_effect=main.CrawlerError("The Chrome window was closed"),
+    )
+
+    try:
+        main.authenticate_with_proxies(mocker.MagicMock(), settings)
+    except main.CrawlerError as exc:
+        assert str(exc) == "The Chrome window was closed"
+    else:
+        raise AssertionError("direct login failure was replaced")
+
+    authenticate.assert_called_once()
 
 
 def test_session_cookie_is_sufficient_even_before_redirect():
@@ -806,6 +956,27 @@ def test_graphql_request_retries_rate_limits(mocker):
     assert data == {"answer": 42}
     assert session.post.await_count == 2
     defer_requests.assert_awaited_once_with(0.5)
+
+
+def test_graphql_request_failure_does_not_expose_proxy_endpoint(mocker):
+    mocker.patch.object(main, "GRAPHQL_RETRIES", 1)
+    session = mocker.MagicMock()
+    session.post = mocker.AsyncMock(
+        side_effect=main.RequestException(
+            "Could not connect to secret-proxy.example:3128"
+        )
+    )
+    client = main.LeetCodeClient(session, "session-value", 0)
+
+    try:
+        asyncio.run(client.graphql_request("operation", "query", {}))
+    except main.CrawlerError as exc:
+        message = str(exc)
+        assert "secret-proxy.example" not in message
+        assert "3128" not in message
+        assert "failed after 1 attempts" in message
+    else:
+        raise AssertionError("request failure did not reach the caller")
 
 
 def test_global_cooldown_extends_a_pending_request(mocker):

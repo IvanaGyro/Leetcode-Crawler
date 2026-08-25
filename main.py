@@ -13,7 +13,7 @@ import time
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Callable, Iterable, Mapping, Sequence
 from urllib.parse import urlsplit
 
 from curl_cffi.requests.exceptions import RequestException
@@ -25,6 +25,10 @@ from git_operations import (
     git_push,
     open_submission_repository,
 )
+
+
+class CredentialError(CrawlerError):
+    """LeetCode rejected the configured account credentials."""
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -336,6 +340,8 @@ def resolve_proxy_settings() -> tuple[ProxySettings, ...]:
             valid_server = (
                 parsed.scheme == "http"
                 and parsed.hostname is not None
+                and parsed.username is None
+                and parsed.password is None
                 and parsed.port == port
                 and 1 <= port <= 65_535
             )
@@ -601,7 +607,7 @@ class LeetCodeClient:
                 if attempt == GRAPHQL_RETRIES - 1:
                     raise CrawlerError(
                         f"LeetCode request {operation_name!r} failed after "
-                        f"{GRAPHQL_RETRIES} attempts: {exc}"
+                        f"{GRAPHQL_RETRIES} attempts"
                     ) from exc
                 await asyncio.sleep(min(2**attempt, 30))
                 continue
@@ -1009,7 +1015,7 @@ def login(page: Any, settings: Settings) -> None:
         last_messages = _visible_login_messages(page)
         explicit_error = credential_error(last_messages)
         if explicit_error:
-            raise CrawlerError(f"LeetCode login failed: {explicit_error}")
+            raise CredentialError(f"LeetCode login failed: {explicit_error}")
 
         try:
             button_is_ready = (
@@ -1070,7 +1076,7 @@ def login(page: Any, settings: Settings) -> None:
         last_messages = _visible_login_messages(page)
         explicit_error = credential_error(last_messages)
         if explicit_error:
-            raise CrawlerError(f"LeetCode login failed: {explicit_error}")
+            raise CredentialError(f"LeetCode login failed: {explicit_error}")
 
         now = time.monotonic()
         turnstile_response = _turnstile_response(page)
@@ -1230,14 +1236,7 @@ async def run_check(
     )
 
 
-async def run_authenticated(
-    session_cookie: str,
-    settings: Settings,
-    checkpoint: int,
-    check_limit: int | None,
-) -> tuple[list[Path], int, int] | None:
-    from curl_cffi.requests import AsyncSession
-
+def authenticated_session_options(settings: Settings) -> dict[str, Any]:
     headers = {
         "Accept": "application/json",
         "Content-Type": "application/json",
@@ -1245,7 +1244,7 @@ async def run_authenticated(
         "Referer": f"{LEETCODE_URL}/",
     }
     proxy = settings.proxy
-    async with AsyncSession(
+    return dict(
         headers=headers,
         impersonate="chrome",
         max_clients=settings.concurrent_downloads,
@@ -1254,7 +1253,49 @@ async def run_authenticated(
         proxy_auth=(proxy.username, proxy.password)
         if proxy and proxy.username
         else None,
-    ) as session:
+    )
+
+
+async def validate_authenticated_api(
+    session_cookie: str, settings: Settings
+) -> None:
+    from curl_cffi.requests import AsyncSession
+
+    async with AsyncSession(**authenticated_session_options(settings)) as session:
+        client = LeetCodeClient(
+            session,
+            session_cookie,
+            settings.request_delay_seconds,
+        )
+        data = await client.graphql_request(
+            "userProgressQuestionList",
+            USER_PROGRESS_QUERY,
+            {
+                "filters": {
+                    "questionStatus": "SOLVED",
+                    "skip": 0,
+                    "limit": 1,
+                }
+            },
+        )
+        container = data.get("userProgressQuestionList")
+        if not isinstance(container, Mapping) or not isinstance(
+            container.get("questions"), list
+        ):
+            raise CrawlerError(
+                "LeetCode did not return the signed-in user's solved questions"
+            )
+
+
+async def run_authenticated(
+    session_cookie: str,
+    settings: Settings,
+    checkpoint: int,
+    check_limit: int | None,
+) -> tuple[list[Path], int, int] | None:
+    from curl_cffi.requests import AsyncSession
+
+    async with AsyncSession(**authenticated_session_options(settings)) as session:
         client = LeetCodeClient(
             session,
             session_cookie,
@@ -1310,7 +1351,7 @@ def settings_for_proxy(
         return replace(settings, proxy=None)
 
     profile_key = hashlib.sha256(
-        f"{proxy.server}\0{proxy.username}".encode("utf-8")
+        f"{settings.username}\0{proxy.server}\0{proxy.username}".encode("utf-8")
     ).hexdigest()[:16]
     return replace(
         settings,
@@ -1370,7 +1411,9 @@ def authenticate_candidate(playwright: Any, settings: Settings) -> str:
 
 
 def authenticate_with_proxies(
-    playwright: Any, settings: Settings
+    playwright: Any,
+    settings: Settings,
+    validate_candidate: Callable[[str, Settings], None] | None = None,
 ) -> tuple[str, Settings]:
     candidates: tuple[ProxySettings | None, ...] = (
         settings.proxy_candidates if settings.proxy_candidates else (None,)
@@ -1393,7 +1436,11 @@ def authenticate_with_proxies(
                 session_cookie = authenticate_candidate(
                     playwright, candidate_settings
                 )
+            except CredentialError:
+                raise
             except CrawlerError as exc:
+                if not settings.proxy_candidates:
+                    raise
                 print(
                     f"Login round {round_number}/{rounds}, proxy "
                     f"{candidate_number}/{len(candidates)} failed: "
@@ -1401,6 +1448,20 @@ def authenticate_with_proxies(
                     file=sys.stderr,
                 )
                 continue
+
+            if validate_candidate is not None:
+                try:
+                    validate_candidate(session_cookie, candidate_settings)
+                except CrawlerError:
+                    if not settings.proxy_candidates:
+                        raise
+                    print(
+                        f"Login round {round_number}/{rounds}, proxy "
+                        f"{candidate_number}/{len(candidates)} failed: "
+                        "the authenticated API check failed",
+                        file=sys.stderr,
+                    )
+                    continue
 
             if settings.proxy_candidates:
                 print(
@@ -1458,7 +1519,13 @@ def execute(args: argparse.Namespace) -> None:
     # The persistent Chrome profile is used only to create or refresh the human
     # session. Bulk requests receive only its LEETCODE_SESSION cookie.
     with sync_playwright() as playwright:
-        session_cookie, settings = authenticate_with_proxies(playwright, settings)
+        session_cookie, settings = authenticate_with_proxies(
+            playwright,
+            settings,
+            lambda cookie, candidate_settings: asyncio.run(
+                validate_authenticated_api(cookie, candidate_settings)
+            ),
+        )
 
     result = asyncio.run(
         run_authenticated(session_cookie, settings, checkpoint, args.check)
