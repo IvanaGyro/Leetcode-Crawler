@@ -55,8 +55,10 @@ pixi run crawl
 LeetCode may show a CAPTCHA or Turnstile challenge. Complete it in the opened
 browser; the crawler waits up to five minutes per login phase by default. The
 form-loading, Sign In button, and post-click session phases each receive a full
-timeout budget. Patchright removes
-Playwright's browser fingerprints, but does not solve or click the challenge.
+timeout budget. Patchright removes Playwright's browser fingerprints. During
+automated login, the crawler can issue a throttled physical mouse click on a
+visible Cloudflare widget, including one below a closed shadow root; it cannot
+solve a CAPTCHA, and verification can still require human interaction.
 After login, the browser closes and only the `LEETCODE_SESSION` cookie is handed
 to a browser-impersonating `curl-cffi` client. Solution downloads run concurrently
 while request starts respect the configured delay.

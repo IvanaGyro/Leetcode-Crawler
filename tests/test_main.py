@@ -452,14 +452,165 @@ def test_cloudflare_messages_are_not_treated_as_credential_errors():
     )
 
 
+def test_cloudflare_frame_owner_clicks_visible_widget(mocker):
+    page = mocker.MagicMock()
+    ordinary_frame = mocker.MagicMock()
+    ordinary_frame.url = "https://leetcode.com/accounts/login/"
+    challenge_frame = mocker.MagicMock()
+    challenge_frame.url = (
+        "https://challenges.cloudflare.com/cdn-cgi/challenge-platform/widget"
+    )
+    challenge_frame.frame_element.return_value.bounding_box.return_value = {
+        "x": 10,
+        "y": 20,
+        "width": 300,
+        "height": 65,
+    }
+    page.frames = [ordinary_frame, challenge_frame]
+
+    clicked = main._click_cloudflare_challenge_frame(page)
+
+    assert clicked
+    page.mouse.move.assert_called_once_with(40.0, 52.0, steps=8)
+    page.mouse.click.assert_called_once_with(40.0, 52.0)
+
+
+def test_cloudflare_cdp_click_pierces_closed_shadow_roots(mocker):
+    page = mocker.MagicMock()
+    page.frames = []
+    turnstile = mocker.MagicMock()
+    turnstile.count.return_value = 0
+    page.locator.return_value = turnstile
+    cdp = page.context.new_cdp_session.return_value
+    cdp.send.side_effect = [
+        {
+            "root": {
+                "nodeName": "#document",
+                "shadowRoots": [
+                    {
+                        "nodeName": "#document-fragment",
+                        "children": [
+                            {
+                                "nodeName": "IFRAME",
+                                "attributes": [
+                                    "src",
+                                    "https://challenges.cloudflare.com/widget",
+                                ],
+                                "contentDocument": {
+                                    "nodeName": "#document",
+                                    "shadowRoots": [
+                                        {
+                                            "nodeName": "#document-fragment",
+                                            "children": [
+                                                {
+                                                    "nodeName": "INPUT",
+                                                    "attributes": [
+                                                        "type",
+                                                        "checkbox",
+                                                    ],
+                                                    "backendNodeId": 42,
+                                                }
+                                            ],
+                                        }
+                                    ],
+                                },
+                            }
+                        ],
+                    }
+                ],
+            }
+        },
+        {
+            "model": {
+                "border": [10, 20, 30, 20, 30, 40, 10, 40],
+            }
+        },
+    ]
+
+    clicked = main.maybe_click_cloudflare(page)
+
+    assert clicked
+    assert cdp.send.call_args_list == [
+        mocker.call("DOM.getDocument", {"depth": -1, "pierce": True}),
+        mocker.call("DOM.getBoxModel", {"backendNodeId": 42}),
+    ]
+    page.mouse.move.assert_called_once_with(20.0, 30.0, steps=12)
+    page.mouse.click.assert_called_once_with(20.0, 30.0)
+    cdp.detach.assert_called_once_with()
+
+
+def test_cloudflare_click_is_skipped_after_turnstile_produces_token(mocker):
+    page = mocker.MagicMock()
+    turnstile = page.locator.return_value
+    turnstile.count.return_value = 1
+    turnstile.first.input_value.return_value = "verified-token"
+
+    clicked = main.maybe_click_cloudflare(page)
+
+    assert not clicked
+    page.context.new_cdp_session.assert_not_called()
+    page.mouse.click.assert_not_called()
+
+
+def test_login_polls_and_clicks_cloudflare_before_form_appears(mocker):
+    page = mocker.MagicMock()
+    page.url = main.LOGIN_URL
+    clock = [0.0]
+    mocker.patch.object(main.time, "monotonic", side_effect=lambda: clock[0])
+    challenge_click = mocker.patch.object(
+        main, "maybe_click_cloudflare", return_value=True
+    )
+
+    username = mocker.MagicMock()
+    username.is_visible.side_effect = [False, False, True]
+    password = mocker.MagicMock()
+    button = mocker.MagicMock()
+    page.locator.side_effect = {
+        "#id_login": username,
+        "#id_password": password,
+        "#signin_btn": button,
+    }.__getitem__
+    page.wait_for_timeout.side_effect = lambda milliseconds: clock.__setitem__(
+        0, clock[0] + milliseconds / 1_000
+    )
+    page.context.cookies.side_effect = [
+        [],
+        [{"name": "LEETCODE_SESSION", "value": "session"}],
+    ]
+    settings = main.Settings(
+        config_path=Path("config.ini"),
+        submissions_path=Path("submissions"),
+        browser_profile_path=Path(".browser-profile"),
+        username="user",
+        password="password",
+        headless=False,
+        push=False,
+        browser_channel="chrome",
+        login_timeout_seconds=10,
+        request_delay_seconds=0,
+        manual_login=False,
+    )
+
+    main.login(page, settings)
+
+    assert username.is_visible.call_count == 3
+    challenge_click.assert_called_once_with(page)
+    username.fill.assert_called_once_with("user")
+    password.fill.assert_called_once_with("password")
+    page.goto.assert_any_call(main.LEETCODE_URL, wait_until="domcontentloaded")
+
+
 def test_login_waits_for_cloudflare_to_enable_sign_in(mocker):
     page = mocker.MagicMock()
     page.url = main.LOGIN_URL
     clock = [0.0]
     mocker.patch.object(main.time, "monotonic", side_effect=lambda: clock[0])
 
+    challenge_click = mocker.patch.object(
+        main, "maybe_click_cloudflare", return_value=False
+    )
     username = mocker.MagicMock()
-    username.wait_for.side_effect = lambda **_kwargs: clock.__setitem__(0, 9.0)
+    username.is_visible.side_effect = [False] * 18 + [True]
     password = mocker.MagicMock()
     button = mocker.MagicMock()
     button.is_visible.return_value = True
@@ -506,7 +657,8 @@ def test_login_waits_for_cloudflare_to_enable_sign_in(mocker):
 
     assert button.is_enabled.call_count == 3
     button.click.assert_called_once_with(timeout=5_000)
-    username.wait_for.assert_called_once_with(state="visible", timeout=10_000)
+    assert username.is_visible.call_count == 19
+    assert challenge_click.call_count == 5
     page.goto.assert_any_call(main.LEETCODE_URL, wait_until="domcontentloaded")
 
 

@@ -55,6 +55,9 @@ LEETCODE_SESSION_COOKIE = "LEETCODE_SESSION"
 DEFAULT_CONCURRENT_DOWNLOADS = 8
 MAX_CONCURRENT_DOWNLOADS = 32
 PROXY_LOGIN_ROUNDS = 2
+CLOUDFLARE_CHALLENGE_HOST = "challenges.cloudflare.com"
+CLOUDFLARE_CLICK_COOLDOWN_SECONDS = 2.0
+LOGIN_POLL_INTERVAL_MS = 500
 
 LOGIN_ERROR_PHRASES = (
     "incorrect username",
@@ -798,6 +801,119 @@ def _turnstile_response(page: Any) -> str:
         return ""
 
 
+def _node_attributes(node: Mapping[str, Any]) -> dict[str, str]:
+    raw_attributes = list(node.get("attributes") or [])
+    return {
+        str(raw_attributes[index]): str(raw_attributes[index + 1])
+        for index in range(0, len(raw_attributes) - 1, 2)
+    }
+
+
+def _find_cloudflare_checkbox(
+    node: Mapping[str, Any], in_cloudflare_frame: bool = False
+) -> Mapping[str, Any] | None:
+    attributes = _node_attributes(node)
+    node_name = str(node.get("nodeName") or "").upper()
+    if node_name == "IFRAME":
+        in_cloudflare_frame = in_cloudflare_frame or (
+            CLOUDFLARE_CHALLENGE_HOST in attributes.get("src", "")
+        )
+
+    if (
+        in_cloudflare_frame
+        and node_name == "INPUT"
+        and attributes.get("type", "").lower() == "checkbox"
+    ):
+        return node
+
+    children = list(node.get("children") or [])
+    children.extend(node.get("shadowRoots") or [])
+    content_document = node.get("contentDocument")
+    if content_document:
+        children.append(content_document)
+
+    for child in children:
+        if not isinstance(child, Mapping):
+            continue
+        checkbox = _find_cloudflare_checkbox(child, in_cloudflare_frame)
+        if checkbox is not None:
+            return checkbox
+    return None
+
+
+def _click_cloudflare_challenge_frame(page: Any) -> bool:
+    for frame in tuple(page.frames):
+        try:
+            if urlsplit(frame.url).hostname != CLOUDFLARE_CHALLENGE_HOST:
+                continue
+            owner = frame.frame_element()
+            box = owner.bounding_box()
+            if not box:
+                continue
+            width = float(box["width"])
+            height = float(box["height"])
+            if width < 100 or not 40 <= height <= 180:
+                continue
+            x = float(box["x"]) + min(30.0, max(15.0, width * 0.10))
+            y = float(box["y"]) + min(32.0, height * 0.50)
+            page.mouse.move(x, y, steps=8)
+            page.wait_for_timeout(120)
+            page.mouse.click(x, y)
+            return True
+        except Exception:
+            # Challenge frames are transient and can be replaced mid-poll.
+            continue
+    return False
+
+
+def _click_cloudflare_checkbox_via_cdp(page: Any) -> bool:
+    cdp = None
+    try:
+        cdp = page.context.new_cdp_session(page)
+        document = cdp.send(
+            "DOM.getDocument", {"depth": -1, "pierce": True}
+        )
+        root = document.get("root")
+        if not isinstance(root, Mapping):
+            return False
+        checkbox = _find_cloudflare_checkbox(root)
+        if checkbox is None or checkbox.get("backendNodeId") is None:
+            return False
+
+        response = cdp.send(
+            "DOM.getBoxModel",
+            {"backendNodeId": checkbox["backendNodeId"]},
+        )
+        model = response.get("model") or {}
+        border = list(model.get("border") or [])
+        if len(border) < 8:
+            return False
+        x = sum(float(value) for value in border[0:8:2]) / 4
+        y = sum(float(value) for value in border[1:8:2]) / 4
+        page.mouse.move(x, y, steps=12)
+        page.wait_for_timeout(120)
+        page.mouse.click(x, y)
+        return True
+    except Exception:
+        # Shadow roots and challenge nodes can be replaced while traversing.
+        return False
+    finally:
+        if cdp is not None:
+            try:
+                cdp.detach()
+            except Exception:
+                pass
+
+
+def maybe_click_cloudflare(page: Any) -> bool:
+    # Do not disturb a challenge that has already produced a valid token.
+    if _turnstile_response(page):
+        return False
+    if _click_cloudflare_challenge_frame(page):
+        return True
+    return _click_cloudflare_checkbox_via_cdp(page)
+
+
 def login(page: Any, settings: Settings) -> None:
     if has_leetcode_session(page.context.cookies([LEETCODE_URL])):
         page.goto(LEETCODE_URL, wait_until="domcontentloaded")
@@ -827,16 +943,34 @@ def login(page: Any, settings: Settings) -> None:
     username_field = page.locator("#id_login")
     password_field = page.locator("#id_password")
     sign_in_button = page.locator("#signin_btn")
+    last_challenge_attempt_at = float("-inf")
+
+    def attempt_cloudflare_click() -> bool:
+        nonlocal last_challenge_attempt_at
+        now = time.monotonic()
+        if (
+            now - last_challenge_attempt_at
+            < CLOUDFLARE_CLICK_COOLDOWN_SECONDS
+        ):
+            return False
+        last_challenge_attempt_at = now
+        return maybe_click_cloudflare(page)
 
     print("Waiting for LeetCode. Complete any Cloudflare verification shown.")
-    try:
-        username_field.wait_for(
-            state="visible", timeout=remaining_timeout_ms()
-        )
-    except Exception as exc:
+    form_is_visible = False
+    while time.monotonic() < deadline:
+        try:
+            form_is_visible = username_field.is_visible()
+        except Exception:
+            form_is_visible = False
+        if form_is_visible:
+            break
+        attempt_cloudflare_click()
+        page.wait_for_timeout(LOGIN_POLL_INTERVAL_MS)
+    if not form_is_visible:
         raise CrawlerError(
             "The LeetCode login form did not load after Cloudflare verification."
-        ) from exc
+        )
 
     # Each automated-login phase receives its own timeout budget. A slow proxy
     # that used most of the form-loading budget still gets the full button wait.
@@ -876,7 +1010,8 @@ def login(page: Any, settings: Settings) -> None:
             except Exception:
                 # The user may have clicked at the same moment and started navigation.
                 pass
-        page.wait_for_timeout(500)
+        attempt_cloudflare_click()
+        page.wait_for_timeout(LOGIN_POLL_INTERVAL_MS)
 
     if not initial_click_completed:
         cookies = page.context.cookies([LEETCODE_URL])
@@ -906,13 +1041,14 @@ def login(page: Any, settings: Settings) -> None:
             page.goto(LEETCODE_URL, wait_until="domcontentloaded")
             return
 
+        attempt_cloudflare_click()
         try:
             form_is_visible = username_field.is_visible()
         except Exception:
             form_is_visible = False
         if not form_is_visible:
             form_was_hidden = True
-            page.wait_for_timeout(500)
+            page.wait_for_timeout(LOGIN_POLL_INTERVAL_MS)
             continue
 
         last_messages = _visible_login_messages(page)
@@ -958,7 +1094,7 @@ def login(page: Any, settings: Settings) -> None:
                     last_submission_at = time.monotonic()
                     form_was_hidden = False
 
-        page.wait_for_timeout(500)
+        page.wait_for_timeout(LOGIN_POLL_INTERVAL_MS)
 
     mode_hint = (
         "Rerun without --headless so you can complete browser verification."
