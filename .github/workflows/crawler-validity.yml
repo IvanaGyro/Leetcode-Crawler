@@ -5,8 +5,8 @@ on:
     branches: [main]
     types: [opened, reopened, synchronize, ready_for_review]
   schedule:
-    # Every four hours at minute 17, keeping reusable login state fresh.
-    - cron: "17 */4 * * *"
+    # Every day at 05:17 UTC, keeping reusable login state fresh off-peak.
+    - cron: "17 5 * * *"
   workflow_dispatch:
 
 permissions:
